@@ -49,6 +49,8 @@ granting the Lambda read permissions to your email. If we needed to deduplicate 
 we'd either have to keep a record of emails we've received somewhere (money + complexity), or we'd
 need to search via Gmail's API for an existing copy of the email.
 
+The Lambda does not attempt to handle threading in any sort of clean manner.
+
 The Lambda also does not attempt to pass Gmail's SPF checks; Gmail sees the message as being sent
 from some random Amazon, even though it's being uploaded via the Gmail API.
 
