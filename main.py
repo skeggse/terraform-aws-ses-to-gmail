@@ -11,6 +11,13 @@ client_id = environ['GOOGLE_CLIENT_ID']
 client_secret = environ['GOOGLE_CLIENT_SECRET']
 refresh_token = environ['GOOGLE_REFRESH_TOKEN']
 
+extra_gmail_label_ids = environ['EXTRA_GMAIL_LABEL_IDS']
+base_label_ids = ['INBOX', 'UNREAD']
+label_ids = (
+    list(set(base_label_ids) | set(extra_gmail_label_ids.split(':')))
+    if extra_gmail_label_ids else base_label_ids
+)
+
 s3_bucket = environ['S3_BUCKET']
 s3_prefix = environ.get('S3_PREFIX', '')
 
@@ -86,7 +93,7 @@ def lambda_handler(event, context):
             'authorization': auth,
             'content-type': 'application/json',
         },
-        data=json.dumps(dict(addLabelIds=['INBOX', 'UNREAD'])),
+        data=json.dumps(dict(addLabelIds=label_ids)),
     )
     if not res.ok:
         raise Exception(f'[{res.status_code}] {res.text}')
