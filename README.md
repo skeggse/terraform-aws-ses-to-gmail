@@ -55,3 +55,6 @@ The Lambda also does not attempt to pass Gmail's SPF checks; Gmail sees the mess
 from some random Amazon, even though it's being uploaded via the Gmail API.
 
 The Lambda stores your credentials in plaintext environment variables.
+
+Gmail-to-Gmail, it takes about 15 seconds from hitting send to the email appearing in the
+recipient's inbox. This may vary depending on whether the Lambda is warm, and the message size.
