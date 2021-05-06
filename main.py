@@ -17,7 +17,13 @@ s3_prefix = environ.get('S3_PREFIX', '')
 account_id = environ['AWS_ACCOUNT_ID']
 
 
-def memoize_with_expiry(default_valid_sec, grace_period_sec, field_name):
+def memoize_with_expiry(grace_period_sec, default_valid_sec):
+    if not callable(get_expiration):
+        if default_valid_sec is None:
+            raise TypeError('missing one conditionally required argument: \'default_valid_sec\'')
+        expiration_field = get_expiration
+        get_expiration = lambda value: value.get(expiration_field, default_valid_sec)
+
     def inner(fn):
         expiry_mapping = {}
 
@@ -27,8 +33,7 @@ def memoize_with_expiry(default_valid_sec, grace_period_sec, field_name):
             if value is not None and now < value[0]:
                 return value[1]
             value = fn(refresh_token)
-            expires_at = now + value.get(field_name,
-                                         default_valid_sec) - grace_period_sec
+            expires_at = now + value.get('expires_in', default_valid_sec) - grace_period_sec
             expiry_mapping[refresh_token] = expires_at, value
             return value
 
@@ -37,10 +42,7 @@ def memoize_with_expiry(default_valid_sec, grace_period_sec, field_name):
     return inner
 
 
-@memoize_with_expiry(
-    default_valid_sec=60 * 60,
-    grace_period_sec=5 * 60,
-    field_name='expires_in')
+@memoize_with_expiry(grace_period_sec=5 * 60, default_valid_sec=60 * 60)
 def get_access_token(refresh_token: str):
     res = requests.post(
         'https://oauth2.googleapis.com/token',
@@ -48,7 +50,9 @@ def get_access_token(refresh_token: str):
             grant_type='refresh_token',
             refresh_token=refresh_token,
             client_id=client_id,
-            client_secret=client_secret))
+            client_secret=client_secret
+        )
+    )
     res.raise_for_status()
     return res.json()
 
@@ -98,5 +102,6 @@ def lambda_handler(event, context):
     client_s3.put_object_tagging(
         Bucket=incoming_email_bucket,
         Key=object_path,
-        Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]))
+        Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')])
+    )
     print('Marked S3 object for deletion')
