@@ -66,7 +66,6 @@ def lambda_handler(event, context):
 
     token = get_access_token(refresh_token)['access_token']
     auth = f'Bearer {token}'
-    # TODO: apply a label for better security/visibility.
     # TODO: fix deduplication
     res = requests.post(
         'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
