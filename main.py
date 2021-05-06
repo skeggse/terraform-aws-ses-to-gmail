@@ -18,12 +18,6 @@ account_id = environ['AWS_ACCOUNT_ID']
 
 
 def memoize_with_expiry(grace_period_sec, default_valid_sec):
-    if not callable(get_expiration):
-        if default_valid_sec is None:
-            raise TypeError('missing one conditionally required argument: \'default_valid_sec\'')
-        expiration_field = get_expiration
-        get_expiration = lambda value: value.get(expiration_field, default_valid_sec)
-
     def inner(fn):
         expiry_mapping = {}
 
@@ -63,9 +57,9 @@ def lambda_handler(event, context):
 
     client_s3 = boto3.client('s3')
 
-    object_path = incoming_email_prefix + message_id
+    object_path = s3_prefix + message_id
     message = client_s3.get_object(
-        Bucket=incoming_email_bucket,
+        Bucket=s3_bucket,
         Key=object_path,
         ExpectedBucketOwner=account_id,
     )['Body'].read()
@@ -100,7 +94,7 @@ def lambda_handler(event, context):
     print('Updated thread labels')
 
     client_s3.put_object_tagging(
-        Bucket=incoming_email_bucket,
+        Bucket=s3_bucket,
         Key=object_path,
         Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')])
     )
