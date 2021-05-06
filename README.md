@@ -3,6 +3,8 @@ terraform-aws-ses-to-gmail
 
 Configure SES to route traffic to a preauthorized Gmail account with Terraform.
 
+![Technical overview](https://github.com/skeggse/terraform-aws-ses-to-gmail/blob/default/docs/diagram.png)
+
 Usage
 -----
 
