@@ -10,18 +10,18 @@ For personal use:
 
 ```hcl
 module "ses-to-gmail" {
- source  = "github.com/skeggse/terraform-aws-ses-to-gmail"
+  source  = "github.com/skeggse/terraform-aws-ses-to-gmail"
 
- name = "terraform-email-pipe" # Prefix for all the resources we create.
+  name = "terraform-email-pipe" # Prefix for all the resources we create.
 
- recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
- google_oauth = {
-   client_id     = "CLIENT_ID_FROM_SECURE_SOURCE"
-   client_secret = "CLIENT_SECRET_FROM_SECURE_SOURCE"
-   refresh_token = "REFRESH_TOKEN_FROM_SECURE_SOURCE"
- }
+  recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
+  google_oauth = {
+    client_id     = "CLIENT_ID_FROM_SECURE_SOURCE"
+    client_secret = "CLIENT_SECRET_FROM_SECURE_SOURCE"
+    refresh_token = "REFRESH_TOKEN_FROM_SECURE_SOURCE"
+  }
 
- ses_rule_set_id = "default-rule-set" # Optional.
+  ses_rule_set_id = "default-rule-set" # Optional.
 }
 ```
 
@@ -35,3 +35,5 @@ need to search via Gmail's API for an existing copy of the email.
 
 The Lambda also does not attempt to pass Gmail's SPF checks; Gmail sees the message as being sent
 from some random Amazon, even though it's being uploaded via the Gmail API.
+
+The Lambda stores your credentials in plaintext environment variables.
