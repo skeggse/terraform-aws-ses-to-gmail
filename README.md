@@ -8,22 +8,36 @@ Usage
 
 For personal use:
 
-```hcl
-module "ses-to-gmail" {
-  source  = "github.com/skeggse/terraform-aws-ses-to-gmail"
+1. Configure SES for receiving mail, and create the appropriate `MX` records on your domain(s)
+2. Create the module somewhere (and configure a Terraform state/handle other boilerplate)
+3. Instantiate this module:
 
-  name = "terraform-email-pipe" # Prefix for all the resources we create.
+   ```hcl
+   module "ses-to-gmail" {
+     source  = "github.com/skeggse/terraform-aws-ses-to-gmail"
 
-  recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
-  google_oauth = {
-    client_id     = "CLIENT_ID_FROM_SECURE_SOURCE"
-    client_secret = "CLIENT_SECRET_FROM_SECURE_SOURCE"
-    refresh_token = "REFRESH_TOKEN_FROM_SECURE_SOURCE"
-  }
+     name = "terraform-email-pipe" # Prefix for all the resources we create.
 
-  ses_rule_set_id = "default-rule-set" # Optional.
-}
-```
+     recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
+     google_oauth = {
+       client_id     = "CLIENT_ID_FROM_SECURE_SOURCE"
+       client_secret = "CLIENT_SECRET_FROM_SECURE_SOURCE"
+       refresh_token = "REFRESH_TOKEN_FROM_SECURE_SOURCE"
+     }
+
+     ses_rule_set_id = "default-rule-set" # Optional.
+   }
+   ```
+
+4. Create a new [GCP project](https://console.cloud.google.com/projectcreate), and
+   [configure](https://console.cloud.google.com/apis/credentials) a new OAuth 2.0 Client ID pair.
+5. Use the [OAuth Playground](https://developers.google.com/oauthplayground/) to get a refresh token
+   for your personal Google account with the `https://www.googleapis.com/auth/gmail.insert` and
+   `https://www.googleapis.com/auth/gmail.modify` scopes. You'll can use the gear icon to provide
+   your own OAuth credentials, which simplifies this process.
+6. Plug your new client ID, client secret, and refresh token into the `google_oauth` object in the
+   module (be careful with those secrets!)
+5. `terraform apply`
 
 Limitations
 -----------
