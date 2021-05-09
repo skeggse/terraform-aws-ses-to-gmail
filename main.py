@@ -1,10 +1,11 @@
 import base64
 import json
 from os import environ
-import re
 import time
+from typing import Any, Callable, Dict
 
 import boto3
+import botocore
 import requests
 
 client_id = environ['GOOGLE_CLIENT_ID']
@@ -24,11 +25,11 @@ s3_prefix = environ.get('S3_PREFIX', '')
 account_id = environ['AWS_ACCOUNT_ID']
 
 
-def memoize_with_expiry(grace_period_sec, default_valid_sec):
-    def inner(fn):
+def memoize_with_expiry(grace_period_sec: int, default_valid_sec: int):
+    def inner(fn: Callable[[str], Any]) -> Callable[[str], Any]:
         expiry_mapping = {}
 
-        def get(refresh_token: str):
+        def get(refresh_token: str) -> Any:
             value = expiry_mapping.get(refresh_token)
             now = time.monotonic()
             if value is not None and now < value[0]:
@@ -58,29 +59,41 @@ def get_access_token(refresh_token: str):
     return res.json()
 
 
-def lambda_handler(event, context):
+def add_length_header_from_response_stream(
+        stream: botocore.response.ResponseStream, headers: Dict[str, str]
+):
+    try:
+        headers['content-length'] = int(getattr(stream, '_content_length', None))
+    except ValueError:
+        pass
+    return headers
+
+
+def lambda_handler(event: Any, context: Any) -> Any:
     message_id = event['Records'][0]['ses']['mail']['messageId']
     print(f'Received message {message_id}')
 
     client_s3 = boto3.client('s3')
 
     object_path = s3_prefix + message_id
-    message = client_s3.get_object(
+    message_stream = client_s3.get_object(
         Bucket=s3_bucket,
         Key=object_path,
         ExpectedBucketOwner=account_id,
-    )['Body'].read()
+    )['Body']
 
     token = get_access_token(refresh_token)['access_token']
     auth = f'Bearer {token}'
     # TODO: fix deduplication
     res = requests.post(
         'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
-        headers={
-            'authorization': auth,
-            'content-type': 'message/rfc822',
-        },
-        data=message,
+        headers=add_length_header_from_response_stream(
+            message_stream, {
+                'authorization': auth,
+                'content-type': 'message/rfc822',
+            }
+        ),
+        data=message_stream,
     )
     if not res.ok:
         raise Exception(f'[{res.status_code}] {res.text}')

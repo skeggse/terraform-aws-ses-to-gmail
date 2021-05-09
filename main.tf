@@ -2,8 +2,6 @@ locals {
   account_id    = data.aws_caller_identity.current.account_id
   bucket_name   = var.s3_bucket_name == null ? "${var.name}-storage" : var.s3_bucket_name
   function_name = var.name
-
-  bundle_path = "${path.module}/bundle.zip"
 }
 
 data "aws_caller_identity" "current" {}
@@ -118,7 +116,7 @@ resource "aws_cloudwatch_log_group" "function-logs" {
 
 data "archive_file" "bundle" {
   type        = "zip"
-  output_path = local.bundle_path
+  output_path = "${path.module}/bundle.zip"
 
   source {
     content  = file("${path.module}/main.py")
@@ -131,7 +129,7 @@ resource "aws_lambda_function" "function" {
   role          = aws_iam_role.function-role.arn
 
   publish          = true
-  filename         = data.archive_file.bundle.output_path # local.bundle_path
+  filename         = data.archive_file.bundle.output_path
   source_code_hash = data.archive_file.bundle.output_base64sha256
   handler          = "main.lambda_handler"
   # TODO: bundle the requests module before upgrading this.
