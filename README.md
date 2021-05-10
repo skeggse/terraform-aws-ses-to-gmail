@@ -22,9 +22,10 @@ For personal use:
 
      recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
      google_oauth = {
-       client_id     = "CLIENT_ID_FROM_SECURE_SOURCE"
-       client_secret = "CLIENT_SECRET_FROM_SECURE_SOURCE"
-       refresh_token = "REFRESH_TOKEN_FROM_SECURE_SOURCE"
+       client_id = "EXAMPLE.apps.googleusercontent.com"
+       # Example parameters - you determine where these are stored.
+       secret_parameter  = "/Dev/ServiceProviders/GoogleClient"
+       refresh_parameter = "/Dev/TenantCredentials/Google"
      }
 
      ses_rule_set_id = "default-rule-set" # Optional.
@@ -37,9 +38,70 @@ For personal use:
    for your personal Google account with the `https://www.googleapis.com/auth/gmail.insert` and
    `https://www.googleapis.com/auth/gmail.modify` scopes. You'll can use the gear icon to provide
    your own OAuth credentials, which simplifies this process.
-6. Plug your new client ID, client secret, and refresh token into the `google_oauth` object in the
-   module (be careful with those secrets!)
+6. Create two new parameters in SSM parameter store: one for the client secret and one for the refresh token.
+  * For the client secret, provision the json-encoded fields `client_id` and `client_secret`. In the example above, you'd create the
+   `/Dev/ServiceProviders/GoogleClient` parameter with a value that looks like
+   `{"client_id":"EXAMPLE.apps.googleusercontent.com","client_secret":"0cPppYgzfKdHyysI1sPpZF4N"}`.
+  * For the refresh token, provision the json-encoded field `refresh_token`. In the example above, you'd create the
+   `/Dev/TenantCredentials/Google` parameter with a value that looks like
+   `{"client_id":"EXAMPLE.apps.googleusercontent.com","client_secret":"0cPppYgzfKdHyysI1sPpZF4N"}`.
+6. Plug your new client ID into the `google_oauth` object in the module, along with the names of the SSM parameters provisioned.
 5. `terraform apply`
+
+Refresh token updates
+---------------------
+
+Instead of using the OAuth Playground to get a refresh token once, which may in rare cases cease functioning, consider using `terraform-aws-oauth2-authenticator` to simplify reauthorization following the refresh token being revoked:
+
+```hcl
+locals {
+  client_id        = "EXAMPLE.apps.googleusercontent.com"
+  secret_parameter = "/Dev/ServiceProviders/GoogleClient"
+}
+
+module "ses-to-gmail" {
+  ...
+
+  google_oauth = {
+    client_id        = local.client_id
+    secret_parameter = local.secret_parameter
+    token_parameter  = module.authorizer.service_token_parameters.google
+  }
+}
+
+module "authorizer" {
+  source = "github.com/skeggse/terraform-aws-oauth2-authenticator"
+
+  # Prefix for resource names.
+  name             = "authorizer"
+  parameter_prefix = "/Dev/TenantCredentials"
+
+  services = {
+    google = {
+      client_id        = local.client_id
+      secret_parameter = local.secret_parameter
+      extra_params = {
+        access_type = "offline"
+      }
+
+      scopes = [
+        "https://www.googleapis.com/auth/gmail.insert",
+        "https://www.googleapis.com/auth/gmail.modify",
+      ]
+
+      authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+      token_endpoint         = "https://oauth2.googleapis.com/token"
+
+      token_endpoint_auth_method = "parameter"
+
+      # The module also checks the email_verified field in the id_token.
+      identity_field       = "email"
+      identify_with_openid = true
+      permitted_identities = ["user@example.com"]
+    }
+  }
+}
+```
 
 Limitations
 -----------
@@ -53,8 +115,6 @@ The Lambda does not attempt to handle threading in any sort of clean manner.
 
 The Lambda also does not attempt to pass Gmail's SPF checks; Gmail sees the message as being sent
 from some random Amazon, even though it's being uploaded via the Gmail API.
-
-The Lambda stores your credentials in plaintext environment variables.
 
 Gmail-to-Gmail, it takes about 15 seconds from hitting send to the email appearing in the
 recipient's inbox. This may vary depending on whether the Lambda is warm, and the message size.
