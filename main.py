@@ -42,7 +42,7 @@ def memoize_dynamic(timeout_fn):
             now = time.monotonic()
             if prior is not None and now < prior[0]:
                 return prior[1]
-            value = fn(params)
+            value = fn(*params)
             expiry_mapping[params] = now + timeout_fn(value), value
             return value
 
@@ -103,7 +103,7 @@ def lambda_handler(event, context):
         ExpectedBucketOwner=account_id,
     )['Body'].read()
 
-    token = get_access_token(refresh_token)['access_token']
+    token = get_access_token()['access_token']
     auth = f'Bearer {token}'
     # TODO: fix deduplication
     res = requests.post(
