@@ -36,14 +36,12 @@ variable "recipients" {
   type = set(string)
 }
 
-# TODO: support externally-configured credentials
 variable "google_oauth" {
   type = object({
-    client_id     = string
-    client_secret = string
-    refresh_token = string
+    client_id        = string
+    secret_parameter = string
+    token_parameter  = string
   })
-  sensitive = true
 }
 
 variable "inbound_tls_policy" {

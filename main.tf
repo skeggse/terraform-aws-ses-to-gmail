@@ -32,7 +32,6 @@ resource "aws_s3_bucket" "storage" {
   acl    = "private"
   policy = data.aws_iam_policy_document.storage-policy.json
 
-
   lifecycle_rule {
     enabled = true
     id      = "delete-old-forwarded-emails"
@@ -63,54 +62,6 @@ resource "aws_s3_bucket_public_access_block" "storage-bpa" {
   restrict_public_buckets = true
 }
 
-data "aws_iam_policy_document" "function-policy" {
-  statement {
-    effect = "Allow"
-    actions = [
-      "logs:CreateLogGroup",
-      "logs:CreateLogStream",
-      "logs:PutLogEvents",
-    ]
-    resources = ["${aws_cloudwatch_log_group.function-logs.arn}:*"]
-  }
-
-  statement {
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObjectTagging",
-    ]
-    resources = ["arn:aws:s3:::${aws_s3_bucket.storage.bucket}/*"]
-  }
-}
-
-data "aws_iam_policy_document" "assume-function-policy" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_policy" "function-policy" {
-  name   = "${var.name}-policy"
-  policy = data.aws_iam_policy_document.function-policy.json
-}
-
-resource "aws_iam_role" "function-role" {
-  name               = var.name
-  assume_role_policy = data.aws_iam_policy_document.assume-function-policy.json
-  description        = "Allow the ${local.function_name} Lambda to read messages from S3 and mark them for later deletion."
-}
-
-resource "aws_iam_role_policy_attachment" "function" {
-  role       = aws_iam_role.function-role.name
-  policy_arn = aws_iam_policy.function-policy.arn
-}
-
 resource "aws_cloudwatch_log_group" "function-logs" {
   name              = "/aws/lambda/${local.function_name}"
   retention_in_days = 90
@@ -124,6 +75,16 @@ data "archive_file" "bundle" {
     content  = file("${path.module}/main.py")
     filename = "main.py"
   }
+}
+
+data "aws_ssm_parameter" "secret" {
+  name            = var.google_oauth.secret_parameter
+  with_decryption = false
+}
+
+data "aws_ssm_parameter" "token" {
+  name            = var.google_oauth.token_parameter
+  with_decryption = false
 }
 
 resource "aws_lambda_function" "function" {
@@ -145,9 +106,9 @@ resource "aws_lambda_function" "function" {
     variables = {
       AWS_ACCOUNT_ID = local.account_id
 
-      GOOGLE_CLIENT_ID     = var.google_oauth.client_id
-      GOOGLE_CLIENT_SECRET = var.google_oauth.client_secret
-      GOOGLE_REFRESH_TOKEN = var.google_oauth.refresh_token
+      GOOGLE_CLIENT_ID        = var.google_oauth.client_id
+      GOOGLE_SECRET_PARAMETER = data.aws_ssm_parameter.secret.name
+      GOOGLE_TOKEN_PARAMETER  = data.aws_ssm_parameter.token.name
 
       S3_BUCKET = aws_s3_bucket.storage.bucket
       S3_PREFIX = var.s3_bucket_prefix == null ? null : trimsuffix(var.s3_bucket_prefix, "/")
