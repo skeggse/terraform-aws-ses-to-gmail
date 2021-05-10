@@ -40,13 +40,13 @@ For personal use:
    your own OAuth credentials, which simplifies this process.
 6. Create two new parameters in SSM parameter store: one for the client secret and one for the
    refresh token.
-  * For the client secret, provision the json-encoded fields `client_id` and `client_secret`. In the
-    example above, you'd create the `/Dev/ServiceProviders/GoogleClient` parameter with a value that
-    looks like
-    `{"client_id":"EXAMPLE.apps.googleusercontent.com","client_secret":"0cPppYgzfKdHyysI1sPpZF4N"}`.
-  * For the refresh token, provision the json-encoded field `refresh_token`. In the example above,
-    you'd create the `/Dev/TenantCredentials/Google` parameter with a value that looks like
-    `{"refresh_token":"Yy6VnmnpMWdj4zgyLqJ1PQ"}`.
+   * For the client secret, provision the json-encoded fields `client_id` and `client_secret`. In the
+     example above, you'd create the `/Dev/ServiceProviders/GoogleClient` parameter with a value that
+     looks like
+     `{"client_id":"EXAMPLE.apps.googleusercontent.com","client_secret":"0cPppYgzfKdHyysI1sPpZF4N"}`.
+   * For the refresh token, provision the json-encoded field `refresh_token`. In the example above,
+     you'd create the `/Dev/TenantCredentials/Google` parameter with a value that looks like
+     `{"refresh_token":"Yy6VnmnpMWdj4zgyLqJ1PQ"}`.
 7. Plug the new client ID into the `google_oauth` object in the module, along with the names of the
    SSM parameters provisioned.
 8. `terraform apply`
