@@ -18,10 +18,9 @@ secret_parameter = environ['GOOGLE_SECRET_PARAMETER']
 
 extra_gmail_label_ids = environ['EXTRA_GMAIL_LABEL_IDS']
 base_label_ids = ['INBOX', 'UNREAD']
-label_ids = (
-    list(set(base_label_ids)
-         | set(extra_gmail_label_ids.split(':'))) if extra_gmail_label_ids else base_label_ids
-)
+label_ids = (list(set(base_label_ids)
+                  | set(extra_gmail_label_ids.split(':')))
+             if extra_gmail_label_ids else base_label_ids)
 
 s3_bucket = environ['S3_BUCKET']
 s3_prefix = environ.get('S3_PREFIX', '')
@@ -30,6 +29,7 @@ account_id = environ['AWS_ACCOUNT_ID']
 
 
 def memoize_dynamic(timeout_fn):
+
     def inner(fn):
         expiry_mapping = {}
 
@@ -57,31 +57,28 @@ def memoize_with_timeout(timeout_sec):
 
 
 def memoize_with_expiry(grace_period_sec, default_valid_sec):
-    return memoize_dynamic(
-        lambda value: value.get('expires_in', default_valid_sec) - grace_period_sec
-    )
+    return memoize_dynamic(lambda value: value.get(
+        'expires_in', default_valid_sec) - grace_period_sec)
 
 
 @memoize_with_timeout(timeout_sec=60 * 60)
 def get_parameter(parameter_name: str):
     return json.loads(
-        ssm_client.get_parameter(Name=parameter_name, WithDecryption=True)['Parameter']['Value']
-    )
+        ssm_client.get_parameter(Name=parameter_name,
+                                 WithDecryption=True)['Parameter']['Value'])
 
 
 @memoize_with_expiry(grace_period_sec=5 * 60, default_valid_sec=60 * 60)
 def get_access_token():
     client_secret = get_parameter(secret_parameter)['client_secret']
     refresh_token = get_parameter(token_parameter)['refresh_token']
-    res = requests.post(
-        'https://oauth2.googleapis.com/token',
-        data=dict(
-            grant_type='refresh_token',
-            refresh_token=refresh_token,
-            client_id=client_id,
-            client_secret=client_secret,
-        )
-    )
+    res = requests.post('https://oauth2.googleapis.com/token',
+                        data=dict(
+                            grant_type='refresh_token',
+                            refresh_token=refresh_token,
+                            client_id=client_id,
+                            client_secret=client_secret,
+                        ))
 
     if res.status_code in {401, 403}:
         # Reset parameters.
@@ -138,6 +135,5 @@ def lambda_handler(event, context):
     s3_client.put_object_tagging(
         Bucket=s3_bucket,
         Key=object_path,
-        Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')])
-    )
+        Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]))
     print('Marked S3 object for deletion')
