@@ -1,6 +1,5 @@
 from email.parser import BytesParser
 from email.feedparser import FeedParser
-from email.generator import BytesGenerator
 from email.utils import format_datetime, parsedate_to_datetime
 from functools import cache, reduce
 from inspect import getfullargspec, ismethod
@@ -160,6 +159,38 @@ def google_session() -> requests.Session:
     return session
 
 
+class SpecialReader(io.RawIOBase):
+
+    def __init__(self, stream):
+        self.stream = stream
+        self._prev_byte = None
+        self.line_ending = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.stream.close()
+
+    def readable(self):
+        return True
+
+    def read(self, n=None):
+        # botocore's StreamingBody will just infinite loop for reads with
+        # negative counts, so massage it into "read all."
+        value = self.stream.read(None if n < 0 else n)
+        if self.line_ending is None:
+            try:
+                idx = value.index(b'\n')
+            except IndexError:
+                print('not in first block')
+                self._prev_byte = value[-1]
+                return value
+            if idx != 0: self._prev_byte = value[idx - 1]
+            self.line_ending = '\r\n' if self._prev_byte == b'\r'[0] else '\n'
+        return value
+
+
 def get_message_metadata(message):
     with google_session() as sess:
         res = sess.get(
@@ -218,29 +249,27 @@ def deduplicate_email(rfc822_msg_id: str) -> int:
         return len(messages)
 
 
-assert callable(
-    BytesGenerator._dispatch), 'private BytesGenerator contract has changed'
-
-
-class RawBytesGenerator(BytesGenerator):
-
-    def _write(self, msg):
-        self._write_headers(msg)
-        # Bypass all the serialization and line conversions.
-        self.write(msg.get_payload())
-
-    @staticmethod
-    def convert_bytes(msg, linesep: str = '\r\n'):
-        fp = io.BytesIO()
-        g = RawBytesGenerator(fp,
-                              mangle_from_=False,
-                              policy=msg.policy.clone(max_line_length=None))
-        g.flatten(msg, linesep=linesep)
-        return fp.getvalue()
-
-
 def infer_linesep(data: bytes) -> str:
     return '\r\n' if data[data.index(b'\n') - 1] == b'\r'[0] else '\n'
+
+
+def pipe(reader, dest):
+    while True:
+        data = reader.read(io.DEFAULT_BUFFER_SIZE)
+        if not data: break
+        dest(data)
+
+
+def parse_email_headers(reader):
+    feedparser = FeedParser()
+    feedparser._set_headersonly()
+    fp = io.TextIOWrapper(reader,
+                          encoding='ascii',
+                          errors='surrogateescape',
+                          newline='')
+    # TODO: stop feeding once headers have been parsed.
+    pipe(fp, feedparser.feed)
+    return feedparser.close()
 
 
 def forward_email(message_id: str, proactive_duplicate_check: bool = False):
@@ -253,8 +282,10 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
         ExpectedBucketOwner=account_id,
     )
 
-    msg_bytes = obj['Body'].read()
-    pmsg = BytesParser().parsebytes(msg_bytes, headersonly=True)
+    # TODO: tee the read stream so we can pass it through to the multipart
+    # encoder.
+    with SpecialReader(obj['Body']) as reader:
+        pmsg = parse_email_headers(reader)
 
     mark_as_spam = pmsg.get('x-ses-spam-verdict') != 'PASS' or pmsg.get(
         'x-ses-virus-verdict') != 'PASS'
@@ -279,15 +310,7 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
         not parsed_date
         or abs(parsed_date.timestamp() - obj_date.timestamp()) > 5 * 60)
     if update_timestamp:
-        # TODO: include the message-provided timezone, at least?
-        new_header = format_datetime(obj_date)
-        print(f'Overwriting date header: {new_header}')
-        if 'date' in pmsg:
-            pmsg.replace_header('Date', new_header)
-        else:
-            pmsg['Date'] = new_header
-        msg_bytes = RawBytesGenerator.convert_bytes(
-            pmsg, linesep=infer_linesep(msg_bytes))
+        message_metadata['internalDate'] = int(obj_date.timestamp() * 1000)
 
     with google_session() as sess:
         # TODO: fix deduplication
