@@ -1,4 +1,8 @@
-from functools import cache
+from email.parser import BytesParser
+from email.feedparser import FeedParser
+from email.generator import BytesGenerator
+from email.utils import format_datetime, parsedate_to_datetime
+from functools import cache, reduce
 from inspect import getfullargspec, ismethod
 import io
 import json
@@ -6,7 +10,7 @@ from os import environ
 from requests_toolbelt import MultipartEncoder
 from requests_oauthlib import OAuth2Session
 import time
-from typing import Callable, Optional, Generic, TypeVar
+from typing import Callable, Optional, TypeVar
 
 import boto3
 import oauthlib
@@ -156,26 +160,90 @@ def google_session() -> requests.Session:
     return session
 
 
-# N.B. for whatever reason, MultipartEncoder doesn't like doing to_string() with
-# this reader. It just spins forever. Possibly because
-class SizedReader(object):
-
-    def __init__(self, stream, size: int):
-        self.stream = stream
-        self.len = size
-
-    def read(self, n=None):
-        if n < 0:
-            # botocore's StreamingBody will just infinite loop for reads with
-            # negative counts, so massage it into "read all."
-            n = None
-        value = self.stream.read(n)
-        self.len = max(0, self.len - len(value))
-        assert n is not None or not self.len, f'expected to drain the reader, still have {self.len} bytes'
-        return value
+def get_message_metadata(message):
+    with google_session() as sess:
+        res = sess.get(
+            f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{message["id"]}',
+            params={
+                'format': 'metadata',
+                'metadataHeaders': ['internalDate', 'message-id']
+            })
+        res.raise_for_status()
+        return res.json()
 
 
-def forward_email(message_id: str):
+def prune_message(m1, m2):
+    message_to_keep, message_to_remove = sorted(
+        (m1, m2), key=lambda m: (m['internalDate'], m['historyId'], m['id']))
+    assert message_to_keep['id'] != message_to_remove[
+        'id'], 'Pruning one of two identical messages'
+
+    with google_session() as sess:
+        sess.post(
+            f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_to_remove["id"]}/trash'
+        )
+    return message_to_keep
+
+
+def list_emails_by_rfc822_msg_id(rfc822_msg_id: str):
+    with google_session() as sess:
+        res = sess.get(
+            'https://gmail.googleapis.com/gmail/v1/users/me/messages',
+            params=dict(q=f'rfc822msgid:{rfc822_msg_id}'))
+        res.raise_for_status()
+        data = res.json()
+        for message in data.get('messages', ()):
+            message = get_message_metadata(message)
+            msg_id = next((entry['value']
+                           for entry in message['payload']['headers']
+                           if entry['name'].lower() == 'message-id'), None)
+            assert msg_id is not None, f'no Message-ID found for {message["id"]} ({rfc822_msg_id})'
+            if msg_id == rfc822_msg_id:
+                yield message
+            else:
+                # Suggests malicious behavior. TODO: route this somewhere that
+                # alerts.
+                print(
+                    f'matched `{msg_id}` == `{rfc822_msg_id}` for {message["id"]}'
+                )
+
+
+# TODO: also ensure the x-ses-receipt header matches before removing any emails.
+def deduplicate_email(rfc822_msg_id: str) -> int:
+    with google_session() as sess:
+        messages = list(list_emails_by_rfc822_msg_id(rfc822_msg_id))
+        if 1 < len(messages) <= 3:
+            kept_message = reduce(prune_message, messages)
+            print(f'Kept {kept_message["id"]} for {rfc822_msg_id}')
+        return len(messages)
+
+
+assert callable(
+    BytesGenerator._dispatch), 'private BytesGenerator contract has changed'
+
+
+class RawBytesGenerator(BytesGenerator):
+
+    def _write(self, msg):
+        self._write_headers(msg)
+        # Bypass all the serialization and line conversions.
+        self.write(msg.get_payload())
+
+    @staticmethod
+    def convert_bytes(msg, linesep: str = '\r\n'):
+        fp = io.BytesIO()
+        g = RawBytesGenerator(fp,
+                              mangle_from_=False,
+                              policy=msg.policy.clone(max_line_length=None))
+        g.flatten(msg, linesep=linesep)
+        return fp.getvalue()
+
+
+def infer_linesep(data: bytes) -> str:
+    return '\r\n' if data[data.index(b'\n') - 1] == b'\r'[0] else '\n'
+
+
+def forward_email(message_id: str, proactive_duplicate_check: bool = False):
     print(f'Received message {message_id}')
 
     object_path = s3_prefix + message_id
@@ -185,20 +253,57 @@ def forward_email(message_id: str):
         ExpectedBucketOwner=account_id,
     )
 
+    msg_bytes = obj['Body'].read()
+    pmsg = BytesParser().parsebytes(msg_bytes, headersonly=True)
+
+    mark_as_spam = pmsg.get('x-ses-spam-verdict') != 'PASS' or pmsg.get(
+        'x-ses-virus-verdict') != 'PASS'
+    rfc822_msg_id = pmsg['message-id']
+
+    if proactive_duplicate_check:
+        messages_matched = deduplicate_email(rfc822_msg_id)
+        if messages_matched:
+            print(
+                f'Proactive duplicate check matched {messages_matched} messages'
+            )
+            return
+
+    msg_label_ids = label_ids + ['SPAM'] if mark_as_spam else label_ids
+
+    obj_date = obj['LastModified']
+
+    message_metadata = dict(labelIds=msg_label_ids)
+    date_header = pmsg.get('date')
+    parsed_date = date_header and parsedate_to_datetime(date_header)
+    update_timestamp = (
+        not parsed_date
+        or abs(parsed_date.timestamp() - obj_date.timestamp()) > 5 * 60)
+    if update_timestamp:
+        # TODO: include the message-provided timezone, at least?
+        new_header = format_datetime(obj_date)
+        print(f'Overwriting date header: {new_header}')
+        if 'date' in pmsg:
+            pmsg.replace_header('Date', new_header)
+        else:
+            pmsg['Date'] = new_header
+        msg_bytes = RawBytesGenerator.convert_bytes(
+            pmsg, linesep=infer_linesep(msg_bytes))
+
     with google_session() as sess:
         # TODO: fix deduplication
-        # TODO: add spam label as appropriate
+        # TODO: handle threading
+        # TODO: can we get eventbridge to tell us if this is a possible event
+        # redelivery?
         encoder = MultipartRelatedEncoder(fields=[
-            (None, (None, json.dumps(dict(labelIds=label_ids)),
-                    'application/json')),
-            (None, (None, SizedReader(obj['Body'], obj['ContentLength']),
-                    'message/rfc822')),
+            # TODO: internalDate instead (64bit ms since epoch)?
+            (None, (None, json.dumps(message_metadata), 'application/json')),
+            (None, (None, msg_bytes, 'message/rfc822')),
         ])
         res = sess.post(
             'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
             headers={'content-type': encoder.content_type},
             data=encoder,
-        )
+            params=dict(internalDateSource='dateHeader'))
         res.raise_for_status()
         data = res.json()
         gid, thread_id = data['id'], data['threadId']
@@ -209,6 +314,15 @@ def forward_email(message_id: str):
             Key=object_path,
             Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]))
         print('Marked S3 object for deletion')
+
+        matched_emails = deduplicate_email(rfc822_msg_id)
+        if not matched_emails:
+            print(f'No messages found for rfc822 message id `{rfc822_msg_id}`')
+        elif matched_emails > 3:
+            # TODO: this should really notify
+            print(
+                f'Tried to deduplicate more than three messages for rfc822 message id `{rfc822_msg_id}`!'
+            )
 
 
 def lambda_handler(event, context):
