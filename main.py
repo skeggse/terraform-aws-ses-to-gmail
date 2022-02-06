@@ -1,10 +1,15 @@
-import base64
+from functools import cache
+from inspect import getfullargspec, ismethod
+import io
 import json
 from os import environ
-import re
+from requests_toolbelt import MultipartEncoder
+from requests_oauthlib import OAuth2Session
 import time
+from typing import Callable, Optional, Generic, TypeVar
 
 import boto3
+import oauthlib
 import requests
 
 region = environ.get('AWS_REGION')
@@ -28,112 +33,186 @@ s3_prefix = environ.get('S3_PREFIX', '')
 account_id = environ['AWS_ACCOUNT_ID']
 
 
-def memoize_dynamic(timeout_fn):
+class MultipartRelatedEncoder(MultipartEncoder):
 
-    def inner(fn):
-        expiry_mapping = {}
+    def _iter_fields(self):
+        for field in super()._iter_fields():
+            # Gmail's API does not like the content-disposition header, but
+            # neither requests not requests_toolbelt have an option to elide it.
+            field.headers = {
+                h: v
+                for h, v in field.headers.items()
+                if h.lower() != 'content-disposition'
+            }
+            yield field
 
-        def reset(*params):
-            if params in expiry_mapping:
-                del expiry_mapping[params]
+    @property
+    def content_type(self):
+        return str(f'multipart/related; boundary={self.boundary_value}')
 
-        def get(*params):
+
+P = TypeVar('P')
+T = TypeVar('T')
+
+
+def memoize_with_timeout(timeout_sec: int):
+    """
+    Memoize the given function with a TTL. Attempts no cleanup, and thus will
+    leak unless used for a fixed set of parameters.
+    """
+
+    def inner(fn: Callable[P, T]):
+        expiry_mapping: dict[P, tuple[int, T]] = {}
+
+        def get(*params: P) -> T:
             prior = expiry_mapping.get(params)
             now = time.monotonic()
             if prior is not None and now < prior[0]:
                 return prior[1]
             value = fn(*params)
-            expiry_mapping[params] = now + timeout_fn(value), value
+            expiry_mapping[params] = now + timeout_sec, value
             return value
 
-        get.reset = reset
         return get
 
     return inner
 
 
-def memoize_with_timeout(timeout_sec):
-    return memoize_dynamic(lambda _: timeout_sec)
-
-
-def memoize_with_expiry(grace_period_sec, default_valid_sec):
-    return memoize_dynamic(lambda value: value.get(
-        'expires_in', default_valid_sec) - grace_period_sec)
-
-
 @memoize_with_timeout(timeout_sec=60 * 60)
 def get_parameter(parameter_name: str):
     return json.loads(
-        ssm_client.get_parameter(Name=parameter_name,
-                                 WithDecryption=True)['Parameter']['Value'])
+        ssm_client.get_parameter(
+            Name=parameter_name,
+            WithDecryption=True,
+        )['Parameter']['Value'])
 
 
-@memoize_with_expiry(grace_period_sec=5 * 60, default_valid_sec=60 * 60)
-def get_access_token():
+def replace_param(fn, args, kwargs, param, value):
+    if param in kwargs or not args:
+        kwargs[param] = value
+        return args
+    argspec = getfullargspec(fn)
+    try:
+        idx = argspec.args.index(param)
+    except IndexError:
+        idx = None
+    if ismethod(fn):
+        idx -= 1
+    if idx is not None and len(args) > idx:
+        return args[:idx] + (value, ) + args[idx + 1:]
+    kwargs[param] = value
+    return args
+
+
+class CustomOAuth2Session(OAuth2Session):
+
+    def __init__(self,
+                 *args,
+                 token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.token_fetcher = token_fetcher
+
+    def refresh_token(self, *args, **kwargs):
+        if not args and 'token_url' not in kwargs:
+            kwargs['token_url'] = self.auto_refresh_url
+        try:
+            return super().refresh_token(*args, **kwargs)
+        except (oauthlib.oauth2.rfc6749.errors.InvalidGrantError,
+                oauthlib.oauth2.rfc6749.errors.TokenExpiredError):
+            if self.token_fetcher is None:
+                raise
+            new_token = self.token_fetcher()
+            if new_token is None or new_token == self.token['refresh_token']:
+                raise
+            args = replace_param(super().refresh_token, args, kwargs,
+                                 'refresh_token', new_token)
+            return super().refresh_token(*args, **kwargs)
+
+
+@cache
+def google_session() -> requests.Session:
     client_secret = get_parameter(secret_parameter)['client_secret']
     refresh_token = get_parameter(token_parameter)['refresh_token']
-    res = requests.post('https://oauth2.googleapis.com/token',
-                        data=dict(
-                            grant_type='refresh_token',
-                            refresh_token=refresh_token,
-                            client_id=client_id,
-                            client_secret=client_secret,
-                        ))
+    session = CustomOAuth2Session(
+        client_id=client_id,
+        auto_refresh_url='https://oauth2.googleapis.com/token',
+        auto_refresh_kwargs=dict(
+            client_id=client_id,
+            client_secret=client_secret,
+        ),
+        # New tokens that get auto-refreshed should not interrupt the request,
+        # as we do not store the new access tokens. This may result in other
+        # access tokens expiring randomly, so this only works for low-
+        # concurrency applications.
+        token_updater=lambda token: None,
+        token_fetcher=lambda: get_parameter(token_parameter)['refresh_token'],
+        token=dict(
+            refresh_token=refresh_token,
+            token_type='Bearer',
+        ),
+    )
+    session.refresh_token()
+    return session
 
-    if res.status_code in {401, 403}:
-        # Reset parameters.
-        get_parameter.reset(secret_parameter)
-        get_parameter.reset(token_parameter)
 
-    res.raise_for_status()
-    return res.json()
+# N.B. for whatever reason, MultipartEncoder doesn't like doing to_string() with
+# this reader. It just spins forever. Possibly because
+class SizedReader(object):
+
+    def __init__(self, stream, size: int):
+        self.stream = stream
+        self.len = size
+
+    def read(self, n=None):
+        if n < 0:
+            # botocore's StreamingBody will just infinite loop for reads with
+            # negative counts, so massage it into "read all."
+            n = None
+        value = self.stream.read(n)
+        self.len = max(0, self.len - len(value))
+        assert n is not None or not self.len, f'expected to drain the reader, still have {self.len} bytes'
+        return value
 
 
-def lambda_handler(event, context):
-    message_id = event['Records'][0]['ses']['mail']['messageId']
+def forward_email(message_id: str):
     print(f'Received message {message_id}')
 
     object_path = s3_prefix + message_id
-    message = s3_client.get_object(
+    obj = s3_client.get_object(
         Bucket=s3_bucket,
         Key=object_path,
         ExpectedBucketOwner=account_id,
-    )['Body'].read()
-
-    token = get_access_token()['access_token']
-    auth = f'Bearer {token}'
-    # TODO: fix deduplication
-    res = requests.post(
-        'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
-        headers={
-            'authorization': auth,
-            'content-type': 'message/rfc822',
-        },
-        data=message,
     )
-    if res.status_code in {401, 403}:
-        get_access_token.reset()
-    if not res.ok:
-        raise Exception(f'[{res.status_code}] {res.text}')
-    data = res.json()
-    id, thread_id = data['id'], data['threadId']
-    print(f'Created message {id} in thread {thread_id}')
-    res = requests.post(
-        f'https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}/modify',
-        headers={
-            'authorization': auth,
-            'content-type': 'application/json',
-        },
-        data=json.dumps(dict(addLabelIds=label_ids)),
-    )
-    if res.status_code in {401, 403}:
-        get_access_token.reset()
-    if not res.ok:
-        raise Exception(f'[{res.status_code}] {res.text}')
-    print('Updated thread labels')
 
-    s3_client.put_object_tagging(
-        Bucket=s3_bucket,
-        Key=object_path,
-        Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]))
-    print('Marked S3 object for deletion')
+    with google_session() as sess:
+        # TODO: fix deduplication
+        # TODO: add spam label as appropriate
+        encoder = MultipartRelatedEncoder(fields=[
+            (None, (None, json.dumps(dict(labelIds=label_ids)),
+                    'application/json')),
+            (None, (None, SizedReader(obj['Body'], obj['ContentLength']),
+                    'message/rfc822')),
+        ])
+        res = sess.post(
+            'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
+            headers={'content-type': encoder.content_type},
+            data=encoder,
+        )
+        res.raise_for_status()
+        data = res.json()
+        gid, thread_id = data['id'], data['threadId']
+        print(f'Created message {gid} in thread {thread_id}')
+
+        s3_client.put_object_tagging(
+            Bucket=s3_bucket,
+            Key=object_path,
+            Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]))
+        print('Marked S3 object for deletion')
+
+
+def lambda_handler(event, context):
+    records = event['Records']
+    print(f'Processing {len(records)} records')
+    for record in records:
+        forward_email(record['ses']['mail']['messageId'])
