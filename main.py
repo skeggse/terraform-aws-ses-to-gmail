@@ -3,24 +3,27 @@ Forward email blobs stored in S3 (usually delivered by SES) to a private Gmail
 inbox via the OAuth2-authorized Gmail API.
 '''
 
+from datetime import datetime
 from email.message import Message
-from email.feedparser import FeedParser
 from email.generator import BytesGenerator
 from email.parser import BytesParser
 from email.utils import format_datetime, parsedate_to_datetime
-from functools import cache, reduce
+from functools import cache, wraps
 from inspect import getfullargspec, ismethod
 import io
 import json
 from os import environ
-from requests_toolbelt import MultipartEncoder
-from requests_oauthlib import OAuth2Session
 import time
-from typing import Callable, Iterable, Optional, TypeVar
+from typing import Any, Callable, Iterable, Optional, ParamSpec, TypedDict, TypeVar, Union
+import weakref
 
 import boto3
+from botocore.response import StreamingBody
 import oauthlib
 import requests
+from urllib3.fields import RequestField
+from requests_oauthlib import OAuth2Session
+from requests_toolbelt import MultipartEncoder
 
 region = environ.get('AWS_REGION')
 
@@ -45,29 +48,32 @@ s3_prefix = environ.get('S3_PREFIX', '')
 account_id = environ['AWS_ACCOUNT_ID']
 
 
-class MultipartRelatedEncoder(MultipartEncoder):
-    '''
-    An extension to `MultipartEncoder` which enables encoding the content as
-    `multipart/related` instead of `multipart/form-data`, which includes the
-    elision of the `content-disposition` header.
-    '''
-
-    def _iter_fields(self):
-        for field in super()._iter_fields():
-            # Gmail's API does not like the content-disposition header, but
-            # neither requests nor requests_toolbelt have an option to elide it.
-            field.headers = {
-                h: v for h, v in field.headers.items() if h.lower() != 'content-disposition'
-            }
-            yield field
-
-    @property
-    def content_type(self):
-        return f'multipart/related; boundary={self.boundary_value}'
+T = TypeVar('T')  # pylint: disable=invalid-name
 
 
-P = TypeVar('P')
-T = TypeVar('T')
+def cachedmethod(func: T) -> T:
+    cache_dict = weakref.WeakKeyDictionary()
+
+    @wraps(func)
+    def method(self, *args, **kwargs):
+        instance_cache = cache_dict.get(self)
+        if instance_cache is None:
+            instance_cache = cache(func)
+            cache_dict[self] = instance_cache
+        return instance_cache(self, *args, **kwargs)
+
+    return method
+
+
+def cachedproperty(func):
+    return property(cachedmethod(func))
+
+
+def args_key(args, kwargs):
+    return (args, frozenset(kwargs.items()))
+
+
+P = TypeVar('P')  # pylint: disable=invalid-name
 
 
 def memoize_with_timeout(timeout_sec: int):
@@ -76,33 +82,22 @@ def memoize_with_timeout(timeout_sec: int):
     leak unless used for a fixed set of parameters.
     '''
 
-    def inner(func: Callable[P, T]):
-        expiry_mapping: dict[P, tuple[int, T]] = {}
+    def inner(func):
+        expiry_mapping: dict[P, tuple[float, T]] = {}
 
-        def get(*params: P) -> T:
-            prior = expiry_mapping.get(params)
+        def get(*params, **kwargs) -> T:
+            key = args_key(params, kwargs)
+            prior = expiry_mapping.get(key)
             now = time.monotonic()
             if prior is not None and now < prior[0]:
                 return prior[1]
-            value = func(*params)
-            expiry_mapping[params] = now + timeout_sec, value
+            value = func(*params, **kwargs)
+            expiry_mapping[key] = now + timeout_sec, value
             return value
 
         return get
 
     return inner
-
-
-@memoize_with_timeout(timeout_sec=60 * 60)
-def get_parameter(parameter_name: str):
-    '''
-    Retrieve the SSM parameter with the given name, and cache it for an hour.
-    '''
-    return json.loads(
-        ssm_client.get_parameter(Name=parameter_name, WithDecryption=True,)[
-            'Parameter'
-        ]['Value']
-    )
 
 
 def replace_param(func, args, kwargs, param, value):
@@ -117,15 +112,44 @@ def replace_param(func, args, kwargs, param, value):
         return args
     argspec = getfullargspec(func)
     try:
-        idx = argspec.args.index(param)
+        idx = argspec.args.index(param) - ismethod(func)
     except IndexError:
         idx = None
-    if ismethod(func):
-        idx -= 1
     if idx is not None and len(args) > idx:
         return args[:idx] + (value,) + args[idx + 1 :]
     kwargs[param] = value
     return args
+
+
+@memoize_with_timeout(timeout_sec=60 * 60)
+def get_parameter(parameter_name: str):
+    '''
+    Retrieve the SSM parameter with the given name, and cache it for an hour.
+    '''
+    return json.loads(
+        ssm_client.get_parameter(Name=parameter_name, WithDecryption=True)['Parameter']['Value']
+    )
+
+
+class MultipartRelatedEncoder(MultipartEncoder):
+    '''
+    An extension to `MultipartEncoder` which enables encoding the content as
+    `multipart/related` instead of `multipart/form-data`, which includes the
+    elision of the `content-disposition` header.
+    '''
+
+    def _iter_fields(self) -> Iterable[RequestField]:
+        for field in super()._iter_fields():
+            # Gmail's API does not like the content-disposition header, but
+            # neither requests nor requests_toolbelt have an option to elide it.
+            field.headers = {
+                h: v for h, v in field.headers.items() if h.lower() != 'content-disposition'
+            }
+            yield field
+
+    @property
+    def content_type(self) -> str:
+        return f'multipart/related; boundary={self.boundary_value}'
 
 
 class CustomOAuth2Session(OAuth2Session):
@@ -154,6 +178,7 @@ class CustomOAuth2Session(OAuth2Session):
             new_token = self.token_fetcher()
             if new_token is None or new_token == self.token['refresh_token']:
                 raise
+            # This may mutate kwargs in-place.
             args = replace_param(super().refresh_token, args, kwargs, 'refresh_token', new_token)
             return super().refresh_token(*args, **kwargs)
 
@@ -166,8 +191,8 @@ def google_session() -> requests.Session:
     carefully ensure the token is only passed to https://gmail.googleapis.com.
     '''
 
-    client_secret = get_parameter(secret_parameter)['client_secret']
-    refresh_token = get_parameter(token_parameter)['refresh_token']
+    client_secret: str = get_parameter(secret_parameter)['client_secret']
+    refresh_token: str = get_parameter(token_parameter)['refresh_token']
     session = CustomOAuth2Session(
         client_id=client_id,
         auto_refresh_url='https://oauth2.googleapis.com/token',
@@ -190,71 +215,55 @@ def google_session() -> requests.Session:
     return session
 
 
+class GmailHeader(TypedDict):
+    name: str
+    value: str
+
+
 class GmailMessage:
     '''
     Represents a single message object in Gmail, and populates its fields from
     the API. Only provides metadata.
     '''
 
-    def __init__(self, message_id, thread_id=None):
+    def __init__(self, message_id: str, thread_id: Optional[str] = None):
         self.message_id = message_id
         self._thread_id = thread_id
-        self._history_id = None
-        self._metadata = None
-        self._headers = None
-        self._internal_date = None
-        self._rfc822_message_id = None
 
-    def _load(self):
+    @cachedproperty
+    def metadata(self) -> dict[str, Any]:
         with google_session() as sess:
             res = sess.get(
                 f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{self.message_id}',
-                params={
-                    'format': 'metadata',
-                    'metadataHeaders': ['internalDate', 'message-id', 'x-ses-receipt'],
-                },
+                params=dict(
+                    format='metadata',
+                    metadataHeaders=['internalDate', 'message-id', 'x-ses-receipt'],
+                ),
             )
             res.raise_for_status()
-            metadata = res.json()
-            self._metadata = metadata
-            self._thread_id = metadata['threadId']
-            self._history_id = metadata['historyId']
-            self._headers = metadata['payload']['headers']
-            self._internal_date = metadata['internalDate']
-
-            self._rfc822_message_id = self['message-id']
+            return res.json()
 
     @property
-    def thread_id(self):
-        if self._thread_id is None:
-            self._load()
-        return self._thread_id
+    def thread_id(self) -> str:
+        return self._thread_id or self.metadata['threadId']
 
     @property
-    def history_id(self):
-        if self._history_id is None:
-            self._load()
-        return self._history_id
+    def history_id(self) -> str:
+        return self.metadata['historyId']
 
     @property
-    def rfc822_message_id(self):
-        if self._rfc822_message_id is None:
-            self._load()
-        return self._rfc822_message_id
+    def rfc822_message_id(self) -> str:
+        return self['message-id']
 
     @property
-    def headers(self):
-        if self._headers is None:
-            self._load()
-        return self._headers
+    def headers(self) -> list[GmailHeader]:
+        return self.metadata['payload']['headers']
 
     @property
-    def internal_date(self):
-        if self._internal_date is None:
-            self._load()
-        return self._internal_date
+    def internal_date(self) -> int:
+        return int(self.metadata['internalDate'])
 
-    def api(self, action: str = ''):
+    def api(self, action: str = '') -> str:
         '''
         Construct the API URL for the message, along with the given `action`.
         '''
@@ -262,7 +271,7 @@ class GmailMessage:
             action = f'/{action}'
         return f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{self.message_id}{action}'
 
-    def __getitem__(self, header: str):
+    def __getitem__(self, header: str) -> str:
         '''
         Get the value of the single instance of the given `header`. If there are
         multiple such values or no such values, this will fail.
@@ -280,6 +289,7 @@ class GmailMessage:
         '''
         values = list(self.get_all(header))
         assert len(values) <= 1, f'got multiple headers for {header}'
+
         return values[0] if values else default
 
     def get_all(self, header: str) -> Iterable[str]:
@@ -288,25 +298,6 @@ class GmailMessage:
         '''
         lower_header = header.lower()
         return (entry['value'] for entry in self.headers if entry['name'].lower() == lower_header)
-
-
-def prune_message(m1: GmailMessage, m2: GmailMessage):
-    '''
-    Given two supposedly identical messages, prune the one that seems to have
-    been inserted most recently.
-    '''
-
-    assert m1.message_id != m2.message_id, 'Pruning one of two identical messages'
-    assert (
-        m1['x-ses-receipt'] == m2['x-ses-receipt']
-    ), 'Refusing to merge duplicate messages that have different receipt IDs'
-    message_to_keep, message_to_remove = sorted(
-        (m1, m2), key=lambda m: (m.internal_date, m.history_id, m.message_id)
-    )
-
-    with google_session() as sess:
-        sess.post(message_to_remove.api('/trash'))
-    return message_to_keep
 
 
 def list_emails_by_rfc822_msg_id(rfc822_msg_id: str) -> Iterable[GmailMessage]:
@@ -342,17 +333,25 @@ def deduplicate_email(rfc822_msg_id: str, ses_id: Optional[str] = None) -> int:
     belt.
     '''
     messages = list(list_emails_by_rfc822_msg_id(rfc822_msg_id))
-    if ses_id is not None:
-        assert all(
-            m['x-ses-receipt'] == ses_id for m in messages
-        ), 'Multiple SES receipts for the same rfc822 message ID'
+    all_ses_ids = {ses_id} if ses_id is not None else set()
+    assert (
+        len(all_ses_ids | {m['x-ses-receipt'] for m in messages}) == 1
+    ), 'Multiple SES receipts for the same rfc822 message ID'
     if 1 < len(messages) <= 3:
-        kept_message = reduce(prune_message, messages)
+        kept_message = min(messages, key=lambda m: (m.internal_date, m.history_id, m.message_id))
+        with google_session() as sess:
+            for message_to_remove in messages:
+                if message_to_remove is kept_message:
+                    continue
+                assert message_to_remove.message_id != kept_message.message_id
+                sess.post(message_to_remove.api('/trash'))
         print(f'Kept {kept_message.message_id} for {rfc822_msg_id}')
     return len(messages)
 
 
-assert callable(BytesGenerator._dispatch), 'private BytesGenerator contract has changed'
+assert callable(getattr(BytesGenerator, '_write', None)) and callable(
+    getattr(BytesGenerator, '_write_headers', None)
+), 'private BytesGenerator contract has changed'
 
 
 class RawBytesGenerator(BytesGenerator):
@@ -363,7 +362,7 @@ class RawBytesGenerator(BytesGenerator):
     themselves.
     '''
 
-    def _write(self, msg: Message):
+    def _write(self, msg: Message) -> None:
         self._write_headers(msg)
         # Bypass all the serialization and line conversions.
         self.write(msg.get_payload())
@@ -374,10 +373,11 @@ class RawBytesGenerator(BytesGenerator):
         Serialize the given message into a buffer, and return the corresponding
         `bytes`.
         '''
-        fp = io.BytesIO()
-        g = RawBytesGenerator(fp, mangle_from_=False, policy=msg.policy.clone(max_line_length=None))
-        g.flatten(msg, linesep=linesep)
-        return fp.getvalue()
+        bytes_io = io.BytesIO()
+        RawBytesGenerator(
+            bytes_io, mangle_from_=False, policy=msg.policy.clone(max_line_length=None)
+        ).flatten(msg, linesep=linesep)
+        return bytes_io.getvalue()
 
 
 def infer_linesep(data: bytes, default: str = '\n') -> str:
@@ -392,7 +392,116 @@ def infer_linesep(data: bytes, default: str = '\n') -> str:
     return '\r\n' if idx > 0 and data[idx - 1] == b'\r'[0] else '\n'
 
 
-def forward_email(message_id: str, proactive_duplicate_check: bool = False):
+def get_object_tag(*, bucket: str = s3_bucket, key: str, tag: str) -> Optional[str]:
+    '''
+    Get the given case-sensitive `tag` for the given `key`, None if no such tag exists.
+    '''
+    return next(
+        (
+            entry['Value']
+            for entry in s3_client.get_object_tagging(
+                Bucket=bucket, Key=key, ExpectedBucketOwner=account_id
+            )['TagSet']
+            if entry['Key'] == tag
+        ),
+        None,
+    )
+
+
+class S3Object(TypedDict, total=False):
+    AcceptRanges: str
+    Body: StreamingBody
+    ContentLength: int
+    ContentType: str
+    ETag: str
+    LastModified: datetime
+    Metadata: dict[str, Any]
+    ResponseMetadata: Any
+    ServerSideEncryption: Union[Any, str]
+    TagCount: int
+
+
+class SESMessage:
+    # obj: dict[str, Any]
+
+    def __init__(self, bucket: str, key: str):
+        self.bucket = bucket
+        self.key = key
+
+    @cachedproperty
+    def obj(self) -> S3Object:
+        return s3_client.get_object(
+            Bucket=self.bucket, Key=self.key, ExpectedBucketOwner=account_id
+        )
+
+    @cachedmethod
+    def __bytes__(self) -> bytes:
+        return self.body.read()
+
+    @cachedmethod
+    def email_message(self) -> Message:
+        return BytesParser().parsebytes(bytes(self))
+
+    @property
+    def rfc822_message_id(self) -> str:
+        return self.email_message()['message-id']
+
+    @cachedmethod
+    def was_forwarded(self) -> bool:
+        return get_object_tag(bucket=self.bucket, key=self.key, tag='Forwarded') == 'true'
+
+    def set_forwarded(self, value: bool) -> None:
+        s3_client.put_object_tagging(
+            Bucket=self.bucket,
+            Key=self.key,
+            Tagging=dict(TagSet=[dict(Key='Forwarded', Value=str(value).lower())]),
+        )
+
+    @property
+    def body(self) -> StreamingBody:
+        return self.obj['Body']
+
+    @property
+    def last_modified(self) -> datetime:
+        return self.obj['LastModified']
+
+
+def insert_message(ses_msg: SESMessage, metadata: dict[str, Any], content: bytes) -> None:
+    with google_session() as sess:
+        # TODO: handle message threading
+        # TODO: can we get eventbridge to tell us if this is a possible event
+        # redelivery?
+        encoder = MultipartRelatedEncoder(
+            fields=[
+                (None, (None, json.dumps(metadata), 'application/json')),
+                (None, (None, content, 'message/rfc822')),
+            ]
+        )
+        res = sess.post(
+            'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
+            headers={'content-type': encoder.content_type},
+            data=encoder,
+            params=dict(internalDateSource='dateHeader'),
+        )
+        res.raise_for_status()
+        data = res.json()
+        print(f'Created message {data["id"]} in thread {data["threadId"]}')
+
+        ses_msg.set_forwarded(True)
+        print('Marked S3 object for deletion')
+
+        matched_emails = deduplicate_email(ses_msg.rfc822_message_id)
+        if not matched_emails:
+            print(f'No messages found for rfc822 message id `{ses_msg.rfc822_message_id}`')
+        elif matched_emails > 3:
+            # TODO: this should really notify
+            print(
+                'Tried to deduplicate more than three messages for rfc822 '
+                f'message id `{ses_msg.rfc822_message_id}`!'
+            )
+
+
+def forward_email(message_id: str, proactive_duplicate_check: bool = False) -> bool:
     '''
     Forward the email with the given SES message ID, corresponding to the S3
     object key. Optionally verify that the email has not already been forwarded
@@ -401,38 +510,34 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
 
     print(f'Received message {message_id}')
 
-    object_path = s3_prefix + message_id
-    obj = s3_client.get_object(
-        Bucket=s3_bucket,
-        Key=object_path,
-        ExpectedBucketOwner=account_id,
-    )
+    ses_msg = SESMessage(bucket=s3_bucket, key=s3_prefix + message_id)
 
-    msg_bytes = obj['Body'].read()
-    pmsg = BytesParser().parsebytes(msg_bytes, headersonly=True)
+    msg_bytes = bytes(ses_msg)
+    pmsg = ses_msg.email_message()
+
+    # TODO: should this also check the Forwarded header?
+    if proactive_duplicate_check:
+        messages_matched = deduplicate_email(
+            ses_msg.rfc822_message_id, ses_id=pmsg['x-ses-receipt']
+        )
+        if messages_matched:
+            print(f'Proactive duplicate check matched {messages_matched} messages')
+            return False
 
     mark_as_spam = (
         pmsg.get('x-ses-spam-verdict') != 'PASS' or pmsg.get('x-ses-virus-verdict') != 'PASS'
     )
-    rfc822_msg_id = pmsg['message-id']
-
-    if proactive_duplicate_check:
-        messages_matched = deduplicate_email(rfc822_msg_id, ses_id=pmsg['x-ses-receipt'])
-        if messages_matched:
-            print(f'Proactive duplicate check matched {messages_matched} messages')
-            return
-
     msg_label_ids = label_ids + ['SPAM'] if mark_as_spam else label_ids
-
-    obj_date = obj['LastModified']
-
     message_metadata = dict(labelIds=msg_label_ids)
+
+    obj_date = ses_msg.last_modified
+
     date_header = pmsg.get('date')
     parsed_date = date_header and parsedate_to_datetime(date_header)
     update_timestamp = (
         not parsed_date or abs(parsed_date.timestamp() - obj_date.timestamp()) > 5 * 60
     )
-    if update_timestamp:
+    if parsed_date and update_timestamp:
         new_header = format_datetime(
             obj_date.astimezone(parsed_date.tzinfo) if parsed_date else obj_date
         )
@@ -445,46 +550,11 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
         # TODO: stream this instead of buffering it.
         msg_bytes = RawBytesGenerator.convert_bytes(pmsg, linesep=infer_linesep(msg_bytes))
 
-    with google_session() as sess:
-        # TODO: handle message threading
-        # TODO: can we get eventbridge to tell us if this is a possible event
-        # redelivery?
-        encoder = MultipartRelatedEncoder(
-            fields=[
-                (None, (None, json.dumps(message_metadata), 'application/json')),
-                (None, (None, msg_bytes, 'message/rfc822')),
-            ]
-        )
-        res = sess.post(
-            'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
-            headers={'content-type': encoder.content_type},
-            data=encoder,
-            params=dict(internalDateSource='dateHeader'),
-        )
-        res.raise_for_status()
-        data = res.json()
-        gid, thread_id = data['id'], data['threadId']
-        print(f'Created message {gid} in thread {thread_id}')
-
-        s3_client.put_object_tagging(
-            Bucket=s3_bucket,
-            Key=object_path,
-            Tagging=dict(TagSet=[dict(Key='Forwarded', Value='true')]),
-        )
-        print('Marked S3 object for deletion')
-
-        matched_emails = deduplicate_email(rfc822_msg_id)
-        if not matched_emails:
-            print(f'No messages found for rfc822 message id `{rfc822_msg_id}`')
-        elif matched_emails > 3:
-            # TODO: this should really notify
-            print(
-                'Tried to deduplicate more than three messages for rfc822 '
-                f'message id `{rfc822_msg_id}`!'
-            )
+    insert_message(ses_msg=ses_msg, metadata=message_metadata, content=msg_bytes)
+    return True
 
 
-def lambda_handler(event, context):
+def lambda_handler(event: dict[str, Any], context: Any) -> None:  # pylint: disable=unused-argument
     '''
     Handle the Lambda invocation, either via SES -> SNS, or via manual
     invocation to handle operational outages/authentication failure gaps.
@@ -494,26 +564,17 @@ def lambda_handler(event, context):
     if not records:
         # Assume we need to comb through the S3 bucket for recovery purposes.
         for page in s3_client.get_paginator('list_objects_v2').paginate(
-            Bucket=s3_bucket, ExpectedBucketOwner=account_id
+            Bucket=s3_bucket, Prefix=s3_prefix, ExpectedBucketOwner=account_id
         ):
             for obj in page['Contents']:
+                ses_msg = SESMessage(bucket=s3_bucket, key=obj['Key'])
                 key = obj['Key']
-                do_forward = (
-                    True
-                    if event.get('ignoreTags', False)
-                    else not next(
-                        (
-                            entry['Value'] == 'true'
-                            for entry in s3_client.get_object_tagging(
-                                Bucket=s3_bucket, Key=key, ExpectedBucketOwner=account_id
-                            )['TagSet']
-                        ),
-                        False,
-                    )
-                )
+                do_forward = True if event.get('ignoreTags', False) else not ses_msg.was_forwarded()
                 if do_forward:
-                    # TODO: don't re-forward deleted emails.
-                    forward_email(key, proactive_duplicate_check=True)
+                    # TODO: don't re-forward deleted emails. This will only
+                    # happen if we are unsuccessful in recording the result from
+                    # Gmail's API as a Forwarded=true.
+                    forward_email(ses_msg.key, proactive_duplicate_check=True)
     else:
         print(f'Processing {len(records)} records')
         for record in records:
