@@ -10,7 +10,7 @@ from os import environ
 from requests_toolbelt import MultipartEncoder
 from requests_oauthlib import OAuth2Session
 import time
-from typing import Callable, Optional, TypeVar
+from typing import Callable, Iterable, Optional, TypeVar
 
 import boto3
 import oauthlib
@@ -42,7 +42,7 @@ class MultipartRelatedEncoder(MultipartEncoder):
     def _iter_fields(self):
         for field in super()._iter_fields():
             # Gmail's API does not like the content-disposition header, but
-            # neither requests not requests_toolbelt have an option to elide it.
+            # neither requests nor requests_toolbelt have an option to elide it.
             field.headers = {
                 h: v
                 for h, v in field.headers.items()
@@ -52,7 +52,7 @@ class MultipartRelatedEncoder(MultipartEncoder):
 
     @property
     def content_type(self):
-        return str(f'multipart/related; boundary={self.boundary_value}')
+        return f'multipart/related; boundary={self.boundary_value}'
 
 
 P = TypeVar('P')
@@ -160,32 +160,101 @@ def google_session() -> requests.Session:
     return session
 
 
-def get_message_metadata(message):
-    with google_session() as sess:
-        res = sess.get(
-            f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{message["id"]}',
-            params={
-                'format': 'metadata',
-                'metadataHeaders': ['internalDate', 'message-id']
-            })
-        res.raise_for_status()
-        return res.json()
+class GmailMessage(object):
+
+    def __init__(self, message_id, thread_id=None):
+        self.message_id = message_id
+        self._thread_id = thread_id
+        self._history_id = None
+        self._metadata = None
+        self._headers = None
+        self._internal_date = None
+        self._rfc822_message_id = None
+
+    def _load(self):
+        with google_session() as sess:
+            res = sess.get(
+                f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{self.message_id}',
+                params={
+                    'format':
+                    'metadata',
+                    'metadataHeaders':
+                    ['internalDate', 'message-id', 'x-ses-receipt']
+                })
+            res.raise_for_status()
+            metadata = res.json()
+            self._metadata = metadata
+            self._thread_id = metadata['threadId']
+            self._history_id = metadata['historyId']
+            self._headers = metadata['payload']['headers']
+            self._internal_date = metadata['internalDate']
+
+            self._rfc822_message_id = self['message-id']
+
+    @property
+    def thread_id(self):
+        if self._thread_id is None:
+            self._load()
+        return self._thread_id
+
+    @property
+    def history_id(self):
+        if self._history_id is None:
+            self._load()
+        return self._history_id
+
+    @property
+    def rfc822_message_id(self):
+        if self._rfc822_message_id is None:
+            self._load()
+        return self._rfc822_message_id
+
+    @property
+    def headers(self):
+        if self._headers is None:
+            self._load()
+        return self._headers
+
+    @property
+    def internal_date(self):
+        if self._internal_date is None:
+            self._load()
+        return self._internal_date
+
+    def api(self, suffix: str = ''):
+        if suffix and not suffix.startswith('/'): suffix = f'/{suffix}'
+        return f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{self.message_id}{suffix}'
+
+    def __getitem__(self, header):
+        value = self.get(header)
+        if value is None:
+            raise KeyError(f'no header for {header}')
+        return value
+
+    def get(self, header, default=None):
+        values = list(self.get_all(header))
+        assert len(values) <= 1, f'got multiple headers for {header}'
+        return values[0] if values else default
+
+    def get_all(self, header):
+        lower_header = header.lower()
+        return (entry['value'] for entry in self.headers
+                if entry['name'].lower() == lower_header)
 
 
-def prune_message(m1, m2):
+def prune_message(m1: GmailMessage, m2: GmailMessage):
+    assert m1.message_id != m2.message_id, 'Pruning one of two identical messages'
+    assert m1['x-ses-receipt'] == m2[
+        'x-ses-receipt'], 'Refusing to merge duplicate messages that have different receipt IDs'
     message_to_keep, message_to_remove = sorted(
-        (m1, m2), key=lambda m: (m['internalDate'], m['historyId'], m['id']))
-    assert message_to_keep['id'] != message_to_remove[
-        'id'], 'Pruning one of two identical messages'
+        (m1, m2), key=lambda m: (m.internal_date, m.history_id, m.message_id))
 
     with google_session() as sess:
-        sess.post(
-            f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_to_remove["id"]}/trash'
-        )
+        sess.post(message_to_remove.api('/trash'))
     return message_to_keep
 
 
-def list_emails_by_rfc822_msg_id(rfc822_msg_id: str):
+def list_emails_by_rfc822_msg_id(rfc822_msg_id: str) -> Iterable[GmailMessage]:
     with google_session() as sess:
         res = sess.get(
             'https://gmail.googleapis.com/gmail/v1/users/me/messages',
@@ -193,29 +262,30 @@ def list_emails_by_rfc822_msg_id(rfc822_msg_id: str):
         res.raise_for_status()
         data = res.json()
         for message in data.get('messages', ()):
-            message = get_message_metadata(message)
-            msg_id = next((entry['value']
-                           for entry in message['payload']['headers']
-                           if entry['name'].lower() == 'message-id'), None)
-            assert msg_id is not None, f'no Message-ID found for {message["id"]} ({rfc822_msg_id})'
+            gmsg = GmailMessage(message['id'], message['threadId'])
+            msg_id = gmsg.get('Message-ID')
+            assert msg_id is not None, f'no Message-ID found for {gmsg.message_id} ({rfc822_msg_id})'
             if msg_id == rfc822_msg_id:
-                yield message
+                yield gmsg
             else:
                 # Suggests malicious behavior. TODO: route this somewhere that
                 # alerts.
                 print(
-                    f'matched `{msg_id}` == `{rfc822_msg_id}` for {message["id"]}'
+                    f'matched `{msg_id}` == `{rfc822_msg_id}` for {gmsg.message_id}'
                 )
 
 
 # TODO: also ensure the x-ses-receipt header matches before removing any emails.
-def deduplicate_email(rfc822_msg_id: str) -> int:
-    with google_session() as sess:
-        messages = list(list_emails_by_rfc822_msg_id(rfc822_msg_id))
-        if 1 < len(messages) <= 3:
-            kept_message = reduce(prune_message, messages)
-            print(f'Kept {kept_message["id"]} for {rfc822_msg_id}')
-        return len(messages)
+def deduplicate_email(rfc822_msg_id: str, ses_id: Optional[str] = None) -> int:
+    messages = list(list_emails_by_rfc822_msg_id(rfc822_msg_id))
+    if ses_id is not None:
+        assert all(
+            m['x-ses-receipt'] == ses_id for m in
+            messages), 'Multiple SES receipts for the same rfc822 message ID'
+    if 1 < len(messages) <= 3:
+        kept_message = reduce(prune_message, messages)
+        print(f'Kept {kept_message.message_id} for {rfc822_msg_id}')
+    return len(messages)
 
 
 assert callable(
@@ -261,7 +331,8 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
     rfc822_msg_id = pmsg['message-id']
 
     if proactive_duplicate_check:
-        messages_matched = deduplicate_email(rfc822_msg_id)
+        messages_matched = deduplicate_email(rfc822_msg_id,
+                                             ses_id=pmsg['x-ses-receipt'])
         if messages_matched:
             print(
                 f'Proactive duplicate check matched {messages_matched} messages'
@@ -279,9 +350,11 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
         not parsed_date
         or abs(parsed_date.timestamp() - obj_date.timestamp()) > 5 * 60)
     if update_timestamp:
-        # TODO: include the message-provided timezone, at least?
-        new_header = format_datetime(obj_date)
+        new_header = format_datetime(
+            obj_date.astimezone(parsed_date.tzinfo
+                                ) if parsed_date else obj_date)
         print(f'Overwriting date header: {new_header}')
+        # TODO: internalDate instead? Can't seem to get it to work.
         if 'date' in pmsg:
             pmsg.replace_header('Date', new_header)
         else:
@@ -290,12 +363,10 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False):
             pmsg, linesep=infer_linesep(msg_bytes))
 
     with google_session() as sess:
-        # TODO: fix deduplication
-        # TODO: handle threading
+        # TODO: handle message threading
         # TODO: can we get eventbridge to tell us if this is a possible event
         # redelivery?
         encoder = MultipartRelatedEncoder(fields=[
-            # TODO: internalDate instead (64bit ms since epoch)?
             (None, (None, json.dumps(message_metadata), 'application/json')),
             (None, (None, msg_bytes, 'message/rfc822')),
         ])
