@@ -3,11 +3,12 @@ Forward email blobs stored in S3 (usually delivered by SES) to a private Gmail
 inbox via the OAuth2-authorized Gmail API.
 '''
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from email.generator import BytesGenerator
 from email.parser import BytesParser
 from email.utils import format_datetime, parsedate_to_datetime
+from enum import Enum
 from functools import cache, partial, wraps
 from inspect import getfullargspec, ismethod
 import io
@@ -26,6 +27,8 @@ from requests_oauthlib import OAuth2Session
 from requests_toolbelt import MultipartEncoder
 
 region = environ.get('AWS_REGION')
+
+DELIVERY_TIMEOUT = timedelta(minutes=2)
 
 s3_client = boto3.client('s3', region_name=region)
 ssm_client = boto3.client('ssm', region_name=region)
@@ -355,6 +358,7 @@ def deduplicate_email(rfc822_msg_id: str, ses_id: Optional[str] = None) -> int:
     all_ses_ids = {m['x-ses-receipt'] for m in messages}
     if ses_id is not None:
         all_ses_ids.add(ses_id)
+    assert all_ses_ids, 'No SES receipts for the inserted message'
     assert len(all_ses_ids) == 1, 'Multiple SES receipts for the same rfc822 message ID'
     if 1 < len(messages) <= 3:
         kept_message = min(messages, key=lambda m: (m.internal_date, m.history_id, m.message_id))
@@ -444,6 +448,8 @@ class SESMessage:
     A representation of an SES message that's been delivered to S3, along with some parsed metadata.
     '''
 
+    _buffer: Optional[bytes]
+
     def __init__(self, bucket: str, key: str):
         self.bucket = bucket
         self.key = key
@@ -494,16 +500,24 @@ class SESMessage:
         return self.email_message()['message-id']
 
     @cachedmethod
+    def get_tags(self) -> dict[str, str]:
+        return {
+            entry['Key']: entry['Value']
+            for entry in s3_client.get_object_tagging(
+                Bucket=self.bucket, Key=self.key, ExpectedBucketOwner=account_id
+            )['TagSet']
+        }
+
     def was_forwarded(self) -> bool:
         '''Check whether the message has already been marked as forwarded. Cached.'''
-        return get_object_tag(bucket=self.bucket, key=self.key, tag='Forwarded') == 'true'
+        return self.get_tags().get('Forwarded') == 'true'
 
-    def set_forwarded(self, value: bool) -> None:
-        '''Mark the message's S3 object as forwarded.'''
+    def set_tags(self, tags: dict[str, str]) -> None:
+        '''Mark the message's S3 object with particular tags.'''
         s3_client.put_object_tagging(
             Bucket=self.bucket,
             Key=self.key,
-            Tagging=dict(TagSet=[dict(Key='Forwarded', Value=str(value).lower())]),
+            Tagging=dict(TagSet=[dict(Key=key, Value=value) for key, value in tags.items()]),
         )
 
     @property
@@ -522,21 +536,27 @@ class SESMessage:
         return self.obj['LastModified']
 
 
-def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> None:
+def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> GmailMessage:
     '''
     Insert the given SES message into Gmail with the given metadata and modified content.
     '''
 
+    # This block is not a critical section, and must handle the possibility that it runs twice for
+    # the same message concurrently. Unfortunately, due to gmail's preference to replace poorly
+    # formed Message-ID headers with random values, we cannot trivially recover messages that get
+    # inserted, then lost (either due to a runtime environment failure or due to concurrent writes).
+    # As a result, the deduplication logic is imperfect, and fixing it would likely require the use
+    # of dynamodb with a strongly consistent conditional write.
     with google_session() as sess:
         # TODO: handle message threading
-        # TODO: can we get eventbridge to tell us if this is a possible event
-        # redelivery?
         encoder = MultipartRelatedEncoder(
             fields=[
                 (None, (None, json.dumps(metadata), 'application/json')),
                 (None, (None, ses_msg.buffer, 'message/rfc822')),
             ]
         )
+        start_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        ses_msg.set_tags(dict(Forwarded=f'start:{start_at}'))
         res = sess.post(
             'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
             headers={'content-type': encoder.content_type},
@@ -546,33 +566,59 @@ def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> None:
         )
         res.raise_for_status()
         data = res.json()
-        print(f'Created message {data["id"]} in thread {data["threadId"]}')
 
-        ses_msg.set_forwarded(True)
-        print('Marked S3 object for deletion')
+        msg = GmailMessage(data['id'], data['threadId'])
+        print(f'Created message {msg.message_id} in thread {msg.thread_id}')
+
+        forward_success = msg.rfc822_message_id == ses_msg.rfc822_message_id
+        ses_msg.set_tags(
+            dict(Forwarded=str(forward_success).lower(), GmailMessageID=msg.message_id)
+        )
+
+        # Message contained a bad rfc822 message ID, and it was overwritten.
+        if forward_success:
+            print('Marked S3 object for deletion')
+        else:
+            # TODO: take some extra action to recover here.
+            print('Created message had mismatched message ID')
+
+        return msg
 
 
-def forward_email(message_id: str, proactive_duplicate_check: bool = False) -> bool:
+ForwardingDisposition = Enum('ForwardingDisposition', 'PROCEED RECOVER WAIT SKIP')
+
+
+def forward_email(
+    ses_msg: SESMessage, disposition: ForwardingDisposition = ForwardingDisposition.PROCEED
+) -> bool:
     '''
     Forward the email with the given SES message ID, corresponding to the S3 object key. Optionally
     verify that the email has not already been forwarded when `proactive_duplicate_check=True`.
     '''
 
-    print(f'Received message {message_id}')
+    print(f'Received message {ses_msg.key}')
 
-    ses_msg = SESMessage(bucket=s3_bucket, key=s3_prefix + message_id)
     pmsg = ses_msg.email_message()
 
     print(f'Processing message as {ses_msg.rfc822_message_id}')
 
-    # TODO: should this also check the Forwarded header?
-    if proactive_duplicate_check:
+    if disposition == ForwardingDisposition.RECOVER:
         messages_matched = deduplicate_email(
             ses_msg.rfc822_message_id, ses_id=pmsg['x-ses-receipt']
         )
         if messages_matched:
             print(f'Proactive duplicate check matched {messages_matched} messages')
             return False
+        if ses_msg.get_tags().get('GmailMessageID'):
+            print(
+                'Proactive duplicate check detected existing message, but did not recover it from '
+                'its Message-ID header'
+            )
+            return False
+
+        # At least two ways to get here: either we started inserting the message but got
+        # interrupted, or we succeeded in inserting the message but the success got overwritten by
+        # a duplicate forwarding call.
 
     mark_as_spam = (
         pmsg.get('x-ses-spam-verdict') != 'PASS' or pmsg.get('x-ses-virus-verdict') != 'PASS'
@@ -602,7 +648,7 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False) -> b
             pmsg, linesep=infer_linesep(bytes(ses_msg))
         )
 
-    insert_message(ses_msg=ses_msg, metadata=message_metadata)
+    _gmail_message = insert_message(ses_msg=ses_msg, metadata=message_metadata)
 
     matched_copies = deduplicate_email(ses_msg.rfc822_message_id)
     if not matched_copies:
@@ -616,26 +662,67 @@ def forward_email(message_id: str, proactive_duplicate_check: bool = False) -> b
     return True
 
 
+def get_forwarding_disposition(event: dict[str, Any], ses_msg: SESMessage) -> ForwardingDisposition:
+    '''
+    Messages may be forwarded, unforwarded, or in the process of being forwarded. If the message is
+    actively being forwarded, wait for the delivery timeout. Note that eventual consistency means we
+    cannot guarantee that this check is accurate.
+    '''
+    if event.get('ignoreTags', False):
+        return ForwardingDisposition.PROCEED
+    forwarded = ses_msg.get_tags().get('Forwarded', '')
+    if forwarded in {'true', 'false'}:
+        # The 'false' value indicates a previous fatal error, and that a retry should not be
+        # attempted.
+        return ForwardingDisposition.SKIP
+    if not forwarded.startswith('start:'):
+        return ForwardingDisposition.PROCEED
+    retry_after = (
+        datetime.fromisoformat(forwarded[len('start:') :].replace('Z', '+00:00')) + DELIVERY_TIMEOUT
+    )
+    return (
+        ForwardingDisposition.RECOVER
+        if retry_after < datetime.now(timezone.utc)
+        else ForwardingDisposition.WAIT
+    )
+
+
+def get_event_messages(event: dict[str, Any]) -> Iterable[SESMessage]:
+    '''
+    Iterate over the SES messages for the given event.
+    '''
+    records = event.get('Records')
+    if not records:
+        print('Processing all remaining records')
+        # Assume we need to comb through the S3 bucket for recovery purposes.
+        for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=s3_bucket, Prefix=s3_prefix, ExpectedBucketOwner=account_id
+        ):
+            for obj in page['Contents']:
+                yield SESMessage(bucket=s3_bucket, key=obj['Key'])
+    else:
+        print(f'Processing {len(records)} records')
+        yield from (
+            SESMessage(bucket=s3_bucket, key=record['ses']['mail']['messageId'])
+            for record in records
+        )
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> None:  # pylint: disable=unused-argument
     '''
     Handle the Lambda invocation, either via SES -> SNS, or via manual invocation to handle
     operational outages/authentication failure gaps.
     '''
 
-    records = event.get('Records')
-    if not records:
-        # Assume we need to comb through the S3 bucket for recovery purposes.
-        for page in s3_client.get_paginator('list_objects_v2').paginate(
-            Bucket=s3_bucket, Prefix=s3_prefix, ExpectedBucketOwner=account_id
-        ):
-            for obj in page['Contents']:
-                ses_msg = SESMessage(bucket=s3_bucket, key=obj['Key'])
-                do_forward = True if event.get('ignoreTags', False) else not ses_msg.was_forwarded()
-                if do_forward:
-                    # TODO: don't re-forward deleted emails. This will only happen if we are
-                    # unsuccessful in recording the result from Gmail's API as a Forwarded=true.
-                    forward_email(ses_msg.key, proactive_duplicate_check=True)
-    else:
-        print(f'Processing {len(records)} records')
-        for record in records:
-            forward_email(record['ses']['mail']['messageId'])
+    dispositions = set()
+    for ses_msg in get_event_messages(event):
+        disposition = get_forwarding_disposition(event, ses_msg)
+        dispositions.add(disposition)
+        if disposition in (ForwardingDisposition.PROCEED, ForwardingDisposition.RECOVER):
+            # TODO: don't re-forward deleted emails. This will only happen if we are
+            # unsuccessful in recording the result from Gmail's API as a Forwarded=true.
+            forward_email(ses_msg, disposition)
+
+    # TODO: improve retry strategy
+    if 'Records' in event and ForwardingDisposition.WAIT in dispositions:
+        raise Exception('retrying SES request due to WAIT disposition')
