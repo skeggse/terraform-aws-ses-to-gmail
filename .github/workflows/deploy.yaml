@@ -1,7 +1,4 @@
-on:
-  push:
-    branches:
-      - default
+on: [push]
 
 defaults:
   run:
@@ -15,6 +12,10 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Test credential leak
+        run: echo $AWS_SECRET_ACCESS_KEY
+        env:
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       - name: Checkout
         uses: actions/checkout@v2
       # TODO: restructure this as an actual action
