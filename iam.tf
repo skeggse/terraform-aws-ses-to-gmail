@@ -12,7 +12,7 @@ data "aws_iam_policy_document" "function-policy" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["${aws_cloudwatch_log_group.function-logs.arn}:*"]
+    resources = ["${aws_cloudwatch_log_group.function_logs.arn}:*"]
   }
 
   statement {
@@ -46,15 +46,14 @@ data "aws_iam_policy_document" "function-policy" {
 }
 
 module "function_role" {
-  source = "../terraform-modules/role"
-  # source = "github.com/skeggse/terraform-modules//role?ref=main"
+  source = "github.com/skeggse/terraform-modules//role?ref=main"
 
-  name = var.name
-  description        = "the ${local.function_name} Lambda to read messages from S3 and mark them for later deletion."
-  policy = data.aws_iam_policy_document.function-policy.json
+  name        = var.name
+  description = "the ${local.function_name} Lambda to read messages from S3 and mark them for later deletion."
+  policy      = data.aws_iam_policy_document.function-policy.json
   assume_role_principals = [
     {
-      type = "Service"
+      type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
     },
   ]

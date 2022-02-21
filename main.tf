@@ -38,31 +38,44 @@ data "aws_iam_policy_document" "storage-policy" {
 # Temporarily holds the (up to 30MB) raw message data.
 resource "aws_s3_bucket" "storage" {
   bucket = local.bucket_name
-  acl    = "private"
-  policy = data.aws_iam_policy_document.storage-policy.json
+}
 
-  lifecycle_rule {
-    enabled = true
-    id      = "delete-old-forwarded-emails"
-    tags = {
-      Forwarded = "true"
+resource "aws_s3_bucket_policy" "storage_policy" {
+  bucket = aws_s3_bucket.storage.bucket
+  policy = data.aws_iam_policy_document.storage-policy.json
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "storage_lifecycle" {
+  bucket = aws_s3_bucket.storage.bucket
+
+  rule {
+    status = "Enabled"
+    id     = "delete-old-forwarded-emails"
+    filter {
+      and {
+        tags = {
+          Forwarded = "true"
+        }
+      }
     }
 
     expiration {
       days = 7
     }
   }
+}
 
-  server_side_encryption_configuration {
-    rule {
-      apply_server_side_encryption_by_default {
-        sse_algorithm = "AES256"
-      }
+resource "aws_s3_bucket_server_side_encryption_configuration" "storage" {
+  bucket = aws_s3_bucket.storage.bucket
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
     }
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "storage-bpa" {
+resource "aws_s3_bucket_public_access_block" "storage_bpa" {
   bucket = aws_s3_bucket.storage.bucket
 
   block_public_acls       = true
@@ -71,7 +84,7 @@ resource "aws_s3_bucket_public_access_block" "storage-bpa" {
   restrict_public_buckets = true
 }
 
-resource "aws_cloudwatch_log_group" "function-logs" {
+resource "aws_cloudwatch_log_group" "function_logs" {
   name              = "/aws/lambda/${local.function_name}"
   retention_in_days = 90
 }
@@ -97,10 +110,9 @@ data "aws_ssm_parameter" "token" {
 }
 
 module "function" {
-  source = "../terraform-modules/lambda"
-  # source = "github.com/skeggse/terraform-modules//lambda?ref=main"
+  source = "github.com/skeggse/terraform-modules//lambda?ref=main"
 
-  name = local.function_name
+  name     = local.function_name
   role_arn = module.function_role.arn
 
   deploy_bucket = var.deploy_bucket
@@ -108,8 +120,9 @@ module "function" {
   handler = "main.lambda_handler"
   runtime = "python3.9"
 
-  timeout = 60
-  memory_size = 256
+  timeout                = 60
+  memory_size            = 256
+  logs_retention_in_days = 90
 
   env_vars = {
     AWS_ACCOUNT_ID = local.account_id
@@ -127,15 +140,20 @@ module "function" {
   }
 }
 
-resource "aws_lambda_permission" "ses-invoke" {
-  statement_id   = "allowSesInvoke"
+resource "aws_lambda_permission" "ses_invoke" {
+  statement_id_prefix   = "allowSesInvoke"
   function_name  = module.function.function_arn
+  qualifier = module.function.function_qualifier
   principal      = "ses.amazonaws.com"
   action         = "lambda:InvokeFunction"
   source_account = local.account_id
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_ses_receipt_rule" "store-and-forward" {
+resource "aws_ses_receipt_rule" "store_and_forward" {
   name          = "${var.name}-store-and-forward"
   rule_set_name = var.ses_rule_set_name
   recipients    = var.recipients
@@ -161,4 +179,8 @@ resource "aws_ses_receipt_rule" "store-and-forward" {
     # Just in case you change the name on this.
     create_before_destroy = true
   }
+
+  depends_on = [
+    aws_lambda_permission.ses_invoke,
+  ]
 }
