@@ -1,7 +1,4 @@
-on:
-  push:
-    branches:
-      - default
+on: [push]
 
 defaults:
   run:
