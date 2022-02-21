@@ -19,9 +19,14 @@ data "aws_iam_policy_document" "function-policy" {
     effect = "Allow"
     actions = [
       "s3:GetObject",
+      "s3:GetObjectTagging",
+      "s3:ListBucket",
       "s3:PutObjectTagging",
     ]
-    resources = ["arn:aws:s3:::${aws_s3_bucket.storage.bucket}/*"]
+    resources = [
+      "arn:aws:s3:::${aws_s3_bucket.storage.bucket}",
+      "arn:aws:s3:::${aws_s3_bucket.storage.bucket}/*",
+    ]
   }
 
   statement {

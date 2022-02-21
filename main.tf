@@ -97,7 +97,7 @@ resource "aws_lambda_function" "function" {
   handler          = "main.lambda_handler"
   # TODO: bundle the requests module before upgrading this.
   # https://aws.amazon.com/blogs/compute/upcoming-changes-to-the-python-sdk-in-aws-lambda/
-  runtime = "python3.7"
+  runtime = "python3.9"
 
   timeout     = 60
   memory_size = 256
@@ -114,6 +114,8 @@ resource "aws_lambda_function" "function" {
       S3_PREFIX = var.s3_bucket_prefix == null ? null : trimsuffix(var.s3_bucket_prefix, "/")
 
       EXTRA_GMAIL_LABEL_IDS = join(":", var.extra_gmail_label_ids)
+
+      PYTHONPATH = "site-packages"
     }
   }
 }
