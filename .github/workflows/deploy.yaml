@@ -1,0 +1,39 @@
+on:
+  push:
+    branches:
+      - improve-insert
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  upload:
+    name: Upload new version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      # TODO: restructure this as an actual action
+      - name: Checkout action
+        uses: actions/checkout@v2
+        with:
+          repository: "skeggse/terraform-modules"
+          ref: main
+          path: terraform-modules
+      - name: Setup
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.9"
+      - name: Access
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: us-west-2
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github_lambda_upload
+      - name: Upload
+        run: ./terraform-modules/lambda/update_code.py --bucket "$AWS_DEPLOY_BUCKET" --function ses_to_gmail ./
+        env:
+          AWS_DEPLOY_BUCKET: ${{ secrets.AWS_DEPLOY_BUCKET }}
