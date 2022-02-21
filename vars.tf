@@ -2,6 +2,10 @@ variable "name" {
   type = string
 }
 
+variable "deploy_bucket" {
+  type = string
+}
+
 variable "s3_bucket_name" {
   type    = string
   default = null

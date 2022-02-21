@@ -45,29 +45,17 @@ data "aws_iam_policy_document" "function-policy" {
   }
 }
 
-data "aws_iam_policy_document" "assume-function-policy" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
+module "function_role" {
+  source = "../terraform-modules/role"
+  # source = "github.com/skeggse/terraform-modules//role?ref=main"
 
-resource "aws_iam_policy" "function-policy" {
-  name   = "${var.name}-policy"
+  name = var.name
+  description        = "the ${local.function_name} Lambda to read messages from S3 and mark them for later deletion."
   policy = data.aws_iam_policy_document.function-policy.json
-}
-
-resource "aws_iam_role" "function-role" {
-  name               = var.name
-  assume_role_policy = data.aws_iam_policy_document.assume-function-policy.json
-  description        = "Allow the ${local.function_name} Lambda to read messages from S3 and mark them for later deletion."
-}
-
-resource "aws_iam_role_policy_attachment" "function" {
-  role       = aws_iam_role.function-role.name
-  policy_arn = aws_iam_policy.function-policy.arn
+  assume_role_principals = [
+    {
+      type = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    },
+  ]
 }

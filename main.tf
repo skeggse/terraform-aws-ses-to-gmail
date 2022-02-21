@@ -1,3 +1,12 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4"
+    }
+  }
+}
+
 locals {
   account_id    = data.aws_caller_identity.current.account_id
   bucket_name   = var.s3_bucket_name == null ? "${var.name}-storage" : var.s3_bucket_name
@@ -87,42 +96,40 @@ data "aws_ssm_parameter" "token" {
   with_decryption = false
 }
 
-resource "aws_lambda_function" "function" {
-  function_name = local.function_name
-  role          = aws_iam_role.function-role.arn
+module "function" {
+  source = "../terraform-modules/lambda"
+  # source = "github.com/skeggse/terraform-modules//lambda?ref=main"
 
-  publish          = true
-  filename         = data.archive_file.bundle.output_path # local.bundle_path
-  source_code_hash = data.archive_file.bundle.output_base64sha256
-  handler          = "main.lambda_handler"
-  # TODO: bundle the requests module before upgrading this.
-  # https://aws.amazon.com/blogs/compute/upcoming-changes-to-the-python-sdk-in-aws-lambda/
+  name = local.function_name
+  role_arn = module.function_role.arn
+
+  deploy_bucket = var.deploy_bucket
+  # TODO: source these from the deploy object.
+  handler = "main.lambda_handler"
   runtime = "python3.9"
 
-  timeout     = 60
+  timeout = 60
   memory_size = 256
 
-  environment {
-    variables = {
-      AWS_ACCOUNT_ID = local.account_id
+  env_vars = {
+    AWS_ACCOUNT_ID = local.account_id
 
-      GOOGLE_CLIENT_ID        = var.google_oauth.client_id
-      GOOGLE_SECRET_PARAMETER = data.aws_ssm_parameter.secret.name
-      GOOGLE_TOKEN_PARAMETER  = data.aws_ssm_parameter.token.name
+    GOOGLE_CLIENT_ID        = var.google_oauth.client_id
+    GOOGLE_SECRET_PARAMETER = data.aws_ssm_parameter.secret.name
+    GOOGLE_TOKEN_PARAMETER  = data.aws_ssm_parameter.token.name
 
-      S3_BUCKET = aws_s3_bucket.storage.bucket
-      S3_PREFIX = var.s3_bucket_prefix == null ? null : trimsuffix(var.s3_bucket_prefix, "/")
+    S3_BUCKET = aws_s3_bucket.storage.bucket
+    S3_PREFIX = var.s3_bucket_prefix == null ? null : trimsuffix(var.s3_bucket_prefix, "/")
 
-      EXTRA_GMAIL_LABEL_IDS = join(":", var.extra_gmail_label_ids)
+    EXTRA_GMAIL_LABEL_IDS = join(":", var.extra_gmail_label_ids)
 
-      PYTHONPATH = "site-packages"
-    }
+    PYTHONPATH = "site-packages"
   }
 }
 
 resource "aws_lambda_permission" "ses-invoke" {
   statement_id   = "allowSesInvoke"
-  function_name  = aws_lambda_function.function.arn
+  function_name  = module.function.function_arn
   principal      = "ses.amazonaws.com"
   action         = "lambda:InvokeFunction"
   source_account = local.account_id
@@ -145,7 +152,7 @@ resource "aws_ses_receipt_rule" "store-and-forward" {
   }
 
   lambda_action {
-    function_arn    = aws_lambda_function.function.arn
+    function_arn    = module.function.invoke_arn
     invocation_type = "Event"
     position        = 2
   }

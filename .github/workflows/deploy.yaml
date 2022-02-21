@@ -36,6 +36,6 @@ jobs:
           aws-region: us-west-2
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github_lambda_upload
       - name: Upload
-        run: ./terraform-modules/lambda/update_code.py --bucket "$AWS_DEPLOY_BUCKET" --function ses_to_gmail ./
+        run: ./terraform-modules/lambda/update_code.py --bucket "$AWS_DEPLOY_BUCKET" --function forward-emails ./
         env:
           AWS_DEPLOY_BUCKET: ${{ secrets.AWS_DEPLOY_BUCKET }}
