@@ -18,7 +18,9 @@ For personal use:
    module "ses-to-gmail" {
      source  = "github.com/skeggse/terraform-aws-ses-to-gmail"
 
-     name = "terraform-email-pipe" # Prefix for all the resources we create.
+     name           = "terraform-email-pipe" # Prefix for all the resources we create.
+     deploy_bucket  = "myorg-lambda-deploy-myregion" # The bucket hosting the Lambda's code.
+     s3_bucket_name = "The bucket that will host the incoming SES messages."
 
      recipients  = ["mydomain.com"] # Can be individual addresses or whole domains.
      google_oauth = {
