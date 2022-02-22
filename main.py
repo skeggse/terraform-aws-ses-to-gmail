@@ -286,6 +286,10 @@ class GmailMessage:
         '''The (cached) internal date timestamp, as milliseconds since the UTC UNIX epoch.'''
         return int(self.metadata['internalDate'])
 
+    @property
+    def label_ids(self) -> list[str]:
+        return self.metadata['labelIds']
+
     def api(self, action: str = '') -> str:
         '''
         Construct the API URL for the message, along with the given `action`.
@@ -355,7 +359,14 @@ def deduplicate_email(rfc822_msg_id: str, ses_id: Optional[str] = None) -> int:
     the given X-SES-Receipt header as a further safety belt.
     '''
     messages = list(list_emails_by_rfc822_msg_id(rfc822_msg_id))
-    all_ses_ids = {m['x-ses-receipt'] for m in messages}
+    all_ses_ids = {
+        m['x-ses-receipt']
+        for m in messages
+        # Messages (usually test messages) sent from the same Gmail account will show up multiple
+        # times; this isn't helpful, because they won't have the x-ses-receipt header. Skip matching
+        # messages that aren't in all the expected extra labels.
+        if any(label not in m.label_ids for label in extra_gmail_label_ids)
+    }
     if ses_id is not None:
         all_ses_ids.add(ses_id)
     assert all_ses_ids, 'No SES receipts for the inserted message'
