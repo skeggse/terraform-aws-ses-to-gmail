@@ -141,12 +141,12 @@ module "function" {
 }
 
 resource "aws_lambda_permission" "ses_invoke" {
-  statement_id_prefix   = "allowSesInvoke"
-  function_name  = module.function.function_arn
-  qualifier = module.function.function_qualifier
-  principal      = "ses.amazonaws.com"
-  action         = "lambda:InvokeFunction"
-  source_account = local.account_id
+  statement_id_prefix = "allowSesInvoke"
+  function_name       = module.function.function_arn
+  qualifier           = module.function.function_qualifier
+  principal           = "ses.amazonaws.com"
+  action              = "lambda:InvokeFunction"
+  source_account      = local.account_id
 
   lifecycle {
     create_before_destroy = true
