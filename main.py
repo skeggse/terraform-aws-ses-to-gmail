@@ -38,12 +38,9 @@ token_parameter = environ['GOOGLE_TOKEN_PARAMETER']
 secret_parameter = environ['GOOGLE_SECRET_PARAMETER']
 
 extra_gmail_label_ids = environ['EXTRA_GMAIL_LABEL_IDS']
+if extra_gmail_label_ids: extra_gmail_label_ids = set(extra_gmail_label_ids.split(':'))
 base_label_ids = ['INBOX', 'UNREAD']
-label_ids = (
-    list(set(base_label_ids) | set(extra_gmail_label_ids.split(':')))
-    if extra_gmail_label_ids
-    else base_label_ids
-)
+label_ids = list(set(base_label_ids) | extra_gmail_label_ids)
 
 s3_bucket = environ['S3_BUCKET']
 s3_prefix = environ.get('S3_PREFIX', '')
@@ -365,7 +362,7 @@ def deduplicate_email(rfc822_msg_id: str, ses_id: Optional[str] = None) -> int:
         # Messages (usually test messages) sent from the same Gmail account will show up multiple
         # times; this isn't helpful, because they won't have the x-ses-receipt header. Skip matching
         # messages that aren't in all the expected extra labels.
-        if any(label not in m.label_ids for label in extra_gmail_label_ids)
+        if all(label in m.label_ids for label in extra_gmail_label_ids)
     }
     if ses_id is not None:
         all_ses_ids.add(ses_id)
