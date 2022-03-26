@@ -406,8 +406,18 @@ class RawBytesGenerator(BytesGenerator):
 
     def _write(self, msg: Message) -> None:
         self._write_headers(msg)
+
+        # These message objects are not multipart because we only parsed the headers. The
+        # get_payload method's behavior is substantially different if this invariant is violated.
+        assert not msg.is_multipart()
+
         # Bypass all the serialization and line conversions.
-        self.write(msg.get_payload())
+        #
+        # Write the raw payload directly, rather than involving get_payload, because the latter
+        # attempts various forms of decoding despite the fact that we set headers_only to True.
+        # This results in occasional failed attempts at re-encoding the data, which is a mistaken
+        # to begin with.
+        self.write(msg._payload)
 
     @staticmethod
     def convert_bytes(msg: Message, linesep: str = '\r\n') -> bytes:
