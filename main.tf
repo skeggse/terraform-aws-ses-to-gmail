@@ -84,11 +84,6 @@ resource "aws_s3_bucket_public_access_block" "storage_bpa" {
   restrict_public_buckets = true
 }
 
-resource "aws_cloudwatch_log_group" "function_logs" {
-  name              = "/aws/lambda/${local.function_name}"
-  retention_in_days = 90
-}
-
 data "archive_file" "bundle" {
   type        = "zip"
   output_path = local.bundle_path
