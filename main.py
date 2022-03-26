@@ -341,13 +341,16 @@ def list_emails_by_rfc822_msg_id(rfc822_msg_id: str) -> Iterable[GmailMessage]:
     with google_session() as sess:
         res = sess.get(
             'https://gmail.googleapis.com/gmail/v1/users/me/messages',
-            params=dict(q=f'rfc822msgid:{rfc822_msg_id}'),
+            params=dict(q=f'rfc822msgid:{rfc822_msg_id}', includeSpamTrash='true'),
             timeout=30,
         )
         res.raise_for_status()
         data = res.json()
         for message in data.get('messages', ()):
             gmsg = GmailMessage(message['id'], message['threadId'])
+            # Ignore trashed messages for the purposes of deduplication.
+            if 'TRASH' in gmsg.label_ids:
+                continue
             msg_id = gmsg.get('Message-ID')
             assert (
                 msg_id is not None
