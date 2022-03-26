@@ -45,8 +45,9 @@ token_parameter = environ['GOOGLE_TOKEN_PARAMETER']
 secret_parameter = environ['GOOGLE_SECRET_PARAMETER']
 
 extra_gmail_label_ids = environ['EXTRA_GMAIL_LABEL_IDS']
-if extra_gmail_label_ids: extra_gmail_label_ids = set(extra_gmail_label_ids.split(':'))
-base_label_ids = ['INBOX', 'UNREAD']
+if extra_gmail_label_ids:
+    extra_gmail_label_ids = set(extra_gmail_label_ids.split(':'))
+base_label_ids = ['UNREAD']  # INBOX/SPAM get added conditionally.
 label_ids = list(set(base_label_ids) | extra_gmail_label_ids)
 
 s3_bucket = environ['S3_BUCKET']
@@ -640,7 +641,7 @@ def forward_email(
     mark_as_spam = (
         pmsg.get('x-ses-spam-verdict') != 'PASS' or pmsg.get('x-ses-virus-verdict') != 'PASS'
     )
-    msg_label_ids = label_ids + ['SPAM'] if mark_as_spam else label_ids
+    msg_label_ids = label_ids + ['SPAM' if mark_as_spam else 'INBOX']
     message_metadata = dict(labelIds=msg_label_ids)
 
     obj_date = ses_msg.last_modified
