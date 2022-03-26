@@ -339,6 +339,11 @@ def list_emails_by_rfc822_msg_id(rfc822_msg_id: str) -> Iterable[GmailMessage]:
     not implement pagination.
     '''
     with google_session() as sess:
+        # Note that we don't trust the RFC822 Message-ID header, because it's arbitrary user input
+        # from external actors. This could result in a far more expansive query (if it managed to
+        # include a space), or a query that overlaps with a different message. Thus, we must cross-
+        # check the RFC822 Message-ID header of the matched messages, and must verify that they
+        # correspond to the same SES S3 object.
         res = sess.get(
             'https://gmail.googleapis.com/gmail/v1/users/me/messages',
             params=dict(q=f'rfc822msgid:{rfc822_msg_id}', includeSpamTrash='true'),
