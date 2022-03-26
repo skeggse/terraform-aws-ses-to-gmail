@@ -28,7 +28,14 @@ from requests_toolbelt import MultipartEncoder
 
 region = environ.get('AWS_REGION')
 
-DELIVERY_TIMEOUT = timedelta(minutes=2)
+# Window to allow a Lambda to attempt to delivery a message to Gmail. If the start timestamp on the
+# message is more than this old, then we may re-attempt delivery.
+GMAIL_DELIVERY_TIMEOUT = timedelta(minutes=2)
+
+# The acceptable number of seconds it may take for a message to be delivered, as measured by the
+# difference between the S3 object timestamp and the RFC822 Date header. Anecdotally, I've seen a
+# real message take seven minutes to get delivered.
+ACCEPTABLE_DELIVERY_DELAY = 15 * 60
 
 s3_client = boto3.client('s3', region_name=region)
 ssm_client = boto3.client('ssm', region_name=region)
@@ -639,7 +646,8 @@ def forward_email(
     date_header = pmsg.get('date')
     parsed_date = date_header and parsedate_to_datetime(date_header)
     update_timestamp = (
-        not parsed_date or abs(parsed_date.timestamp() - obj_date.timestamp()) > 5 * 60
+        not parsed_date
+        or abs(parsed_date.timestamp() - obj_date.timestamp()) > ACCEPTABLE_DELIVERY_DELAY
     )
     if parsed_date and update_timestamp:
         new_header = format_datetime(
@@ -686,7 +694,8 @@ def get_forwarding_disposition(event: dict[str, Any], ses_msg: SESMessage) -> Fo
     if not forwarded.startswith('start:'):
         return ForwardingDisposition.PROCEED
     retry_after = (
-        datetime.fromisoformat(forwarded[len('start:') :].replace('Z', '+00:00')) + DELIVERY_TIMEOUT
+        datetime.fromisoformat(forwarded[len('start:') :].replace('Z', '+00:00'))
+        + GMAIL_DELIVERY_TIMEOUT
     )
     return (
         ForwardingDisposition.RECOVER
