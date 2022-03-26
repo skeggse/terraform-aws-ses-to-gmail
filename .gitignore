@@ -19,3 +19,5 @@ override.tf.json
 *_override.tf.json
 
 __pycache__
+
+site-packages
