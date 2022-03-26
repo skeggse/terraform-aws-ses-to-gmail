@@ -292,6 +292,7 @@ class GmailMessage:
 
     @property
     def label_ids(self) -> list[str]:
+        '''The (cached) list of label IDs associated with the message.'''
         return self.metadata['labelIds']
 
     def api(self, action: str = '') -> str:
@@ -516,6 +517,7 @@ class SESMessage:
 
     @cachedmethod
     def get_tags(self) -> dict[str, str]:
+        '''The message's current S3 object tags, as a dictionary.'''
         return {
             entry['Key']: entry['Value']
             for entry in s3_client.get_object_tagging(
