@@ -12,7 +12,7 @@ data "aws_iam_policy_document" "function-policy" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["${aws_cloudwatch_log_group.function_logs.arn}:*"]
+    resources = ["${module.function.logs_arn}:*"]
   }
 
   statement {
