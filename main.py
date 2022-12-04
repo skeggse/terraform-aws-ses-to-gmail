@@ -14,11 +14,14 @@ from inspect import getfullargspec, ismethod
 import io
 import json
 from os import environ
+import re
 import time
+import traceback
 from typing import Any, Callable, Iterable, Optional, TypedDict, TypeVar, Union
 import weakref
 
 import boto3
+from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 import oauthlib
 import requests
@@ -57,6 +60,8 @@ s3_prefix = environ.get('S3_PREFIX', '')
 EVENTS_TOPIC_ARN = environ.get('EVENTS_TOPIC_ARN')
 
 account_id = environ['AWS_ACCOUNT_ID']
+
+remove_brackets_pattern = re.compile(r'[]({<>})[]')
 
 
 T = TypeVar('T')  # pylint: disable=invalid-name
@@ -695,13 +700,21 @@ def forward_email(
         # Not important if this happens multiple times, because it'll be consistent. These tags are
         # useful for processing by other systems, especially when coupled with EVENTS_TOPIC_ARN.
         sender = getaddresses([pmsg.get('from') or ''])
-        ses_msg.set_tags(
-            dict(
-                Sender=(sender and sender[0][1]) or None,
-                Subject=pmsg.get('subject'),
-                RFC822MessageID=ses_msg.rfc822_message_id,
-            ),
-        )
+        subject = pmsg.get('subject') or None
+        # AWS tags cannot contain brackets (among other values);
+        msg_id = remove_brackets_pattern.sub('', ses_msg.rfc822_message_id)
+        try:
+            ses_msg.set_tags(
+                dict(
+                    Sender=(sender and sender[0][1][:255]) or None,
+                    Subject=subject and subject[:255],
+                    RFC822MessageID=msg_id if len(msg_id) <= 255 else None,
+                ),
+            )
+        except ClientError as err:
+            if err.response.get('Error', {}).get('Code') != 'InvalidTag':
+                raise
+            traceback.print_exc()
 
     # Note that this may occur multiple times, and the consumer is responsible for deduplicating
     # events.

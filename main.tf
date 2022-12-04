@@ -105,7 +105,7 @@ data "aws_ssm_parameter" "token" {
 }
 
 module "function" {
-  source = "github.com/skeggse/terraform-modules//lambda?ref=main"
+  source = "github.com/skeggse/terraform-modules//lambda"
 
   name     = local.function_name
   role_arn = module.function_role.arn
