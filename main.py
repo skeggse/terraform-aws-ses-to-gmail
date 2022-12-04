@@ -17,7 +17,7 @@ from os import environ
 import re
 import time
 import traceback
-from typing import Any, Callable, Iterable, Optional, TypedDict, TypeVar, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, TypedDict, TypeVar, Union
 import weakref
 
 import boto3
@@ -496,6 +496,8 @@ class SESMessage:
         self.bucket = bucket
         self.key = key
         self._buffer = None
+        tags: dict[str, Optional[str]] = self.get_tags()
+        self._tags = tags
 
     @property
     def buffer(self) -> bytes:
@@ -542,7 +544,7 @@ class SESMessage:
         return self.email_message()['message-id']
 
     @cachedmethod
-    def get_tags(self) -> dict[str, str]:
+    def get_tags(self) -> Mapping[str, str]:
         '''The message's current S3 object tags, as a dictionary.'''
         return {
             entry['Key']: entry['Value']
@@ -555,14 +557,17 @@ class SESMessage:
         '''Check whether the message has already been marked as forwarded. Cached.'''
         return self.get_tags().get('Forwarded') == 'true'
 
-    def set_tags(self, tags: dict[str, Optional[str]]) -> None:
+    def add_tags(self, tags: dict[str, Optional[str]]) -> None:
         '''Mark the message's S3 object with particular tags.'''
+        self._tags.update(tags)
         s3_client.put_object_tagging(
             Bucket=self.bucket,
             Key=self.key,
             Tagging=dict(
                 TagSet=[
-                    dict(Key=key, Value=value) for key, value in tags.items() if value is not None
+                    dict(Key=key, Value=value)
+                    for key, value in self._tags.items()
+                    if value is not None
                 ]
             ),
         )
@@ -603,7 +608,7 @@ def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> GmailMessag
             ]
         )
         start_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-        ses_msg.set_tags(dict(Forwarded=f'start:{start_at}'))
+        ses_msg.add_tags(dict(Forwarded=f'start:{start_at}'))
         res = sess.post(
             'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages',
             headers={'content-type': encoder.content_type},
@@ -618,7 +623,7 @@ def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> GmailMessag
         print(f'Created message {msg.message_id} in thread {msg.thread_id}')
 
         forward_success = msg.rfc822_message_id == ses_msg.rfc822_message_id
-        ses_msg.set_tags(
+        ses_msg.add_tags(
             dict(Forwarded=str(forward_success).lower(), GmailMessageID=msg.message_id)
         )
 
@@ -717,7 +722,7 @@ def forward_email(
         )
         print('Real values:', tags)
         try:
-            ses_msg.set_tags(tags)
+            ses_msg.add_tags(tags)
         except ClientError as err:
             if err.response.get('Error', {}).get('Code') != 'InvalidTag':
                 raise
