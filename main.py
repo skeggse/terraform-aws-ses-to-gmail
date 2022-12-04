@@ -18,6 +18,7 @@ import re
 import time
 import traceback
 from typing import Any, Callable, Iterable, Mapping, Optional, TypedDict, TypeVar, Union
+from urllib.parse import quote
 import weakref
 
 import boto3
@@ -61,7 +62,9 @@ EVENTS_TOPIC_ARN = environ.get('EVENTS_TOPIC_ARN')
 
 account_id = environ['AWS_ACCOUNT_ID']
 
-remove_brackets_pattern = re.compile(r'[]({<>})[]')
+# Tags also support '=', but since we're using that to designate escape sequences we exclude it.
+tag_pattern = re.compile(r'[\w\s_.:/+@-]+')
+inverse_tag_pattern = re.compile(r'[^\w\s_.:/+@-]+')
 
 
 T = TypeVar('T')  # pylint: disable=invalid-name
@@ -559,18 +562,24 @@ class SESMessage:
 
     def add_tags(self, tags: dict[str, Optional[str]]) -> None:
         '''Mark the message's S3 object with particular tags.'''
-        self._tags.update(tags)
-        s3_client.put_object_tagging(
-            Bucket=self.bucket,
-            Key=self.key,
-            Tagging=dict(
-                TagSet=[
-                    dict(Key=key, Value=value)
-                    for key, value in self._tags.items()
-                    if value is not None
-                ]
-            ),
-        )
+        combined_tags = {**self._tags, **tags}
+        try:
+            s3_client.put_object_tagging(
+                Bucket=self.bucket,
+                Key=self.key,
+                Tagging=dict(
+                    TagSet=[
+                        dict(Key=key, Value=value)
+                        for key, value in combined_tags
+                        if value is not None
+                    ]
+                ),
+            )
+        except ClientError as err:
+            if err.response.get('Error', {}).get('Code') != 'InvalidTag':
+                raise
+        else:
+            self._tags = combined_tags
 
     @property
     def body(self) -> StreamingBody:
@@ -635,6 +644,22 @@ def insert_message(ses_msg: SESMessage, metadata: dict[str, Any]) -> GmailMessag
             print('Created message had mismatched message ID')
 
         return msg
+
+
+def encode_for_tags(value: str, trim_to_fit: bool = True) -> Optional[str]:
+    """
+    AWS Tags can't include a variety of values, so to simplify things let's percent-encode
+    everything that's unsupported.
+    """
+    if value and not tag_pattern.fullmatch(value):
+        value = inverse_tag_pattern.sub(
+            lambda match: quote(match.group().encode()).replace('%', '='), value
+        )
+    if len(value) > 256:
+        if not trim_to_fit:
+            return None
+        return value[:256]
+    return value or None
 
 
 ForwardingDisposition = Enum('ForwardingDisposition', 'PROCEED RECOVER WAIT SKIP')
@@ -705,24 +730,22 @@ def forward_email(
         # Not important if this happens multiple times, because it'll be consistent. These tags are
         # useful for processing by other systems, especially when coupled with EVENTS_TOPIC_ARN.
         raw_tag_values = {
-            'from': pmsg.get('from'),
-            'subject': pmsg.get('subject'),
-            'message-id': remove_brackets_pattern.sub('', ses_msg.rfc822_message_id),
+            'from': pmsg.get('from') or '',
+            'subject': pmsg.get('subject') or '',
+            'message-id': ses_msg.rfc822_message_id,
         }
         print('Setting tags')
         print('Raw values:', raw_tag_values)
-        sender = getaddresses([pmsg.get('from') or ''])
-        subject = pmsg.get('subject') or None
-        # AWS tags cannot contain brackets (among other values);
-        msg_id = remove_brackets_pattern.sub('', ses_msg.rfc822_message_id)
-        tags = dict(
-            Sender=(sender and sender[0][1][:255]) or None,
-            Subject=subject and subject[:255],
-            RFC822MessageID=msg_id if len(msg_id) <= 255 else None,
+        sender = getaddresses([raw_tag_values['from']])
+        modified_tag_values: dict[str, str] = dict(
+            Sender=sender[0][1] if sender and sender[0][1] else '',
+            Subject=raw_tag_values['subject'],
+            RFC822MessageID=raw_tag_values['message-id'].removeprefix('<').removesuffix('>'),
         )
-        print('Real values:', tags)
+        encoded_tag_values = {k: encode_for_tags(v) for k, v in modified_tag_values.items()}
+        print('Real values:', encoded_tag_values)
         try:
-            ses_msg.add_tags(tags)
+            ses_msg.add_tags(encoded_tag_values)
         except ClientError as err:
             if err.response.get('Error', {}).get('Code') != 'InvalidTag':
                 raise
