@@ -570,7 +570,7 @@ class SESMessage:
                 Tagging=dict(
                     TagSet=[
                         dict(Key=key, Value=value)
-                        for key, value in combined_tags
+                        for key, value in combined_tags.items()
                         if value is not None
                     ]
                 ),
