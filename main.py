@@ -696,21 +696,28 @@ def forward_email(
             pmsg, linesep=infer_linesep(bytes(ses_msg))
         )
 
-    if disposition == ForwardingDisposition.PROCEED:
+    if not mark_as_spam and disposition == ForwardingDisposition.PROCEED:
         # Not important if this happens multiple times, because it'll be consistent. These tags are
         # useful for processing by other systems, especially when coupled with EVENTS_TOPIC_ARN.
+        raw_tag_values = {
+            'from': pmsg.get('from'),
+            'subject': pmsg.get('subject'),
+            'message-id': remove_brackets_pattern.sub('', ses_msg.rfc822_message_id),
+        }
+        print('Setting tags')
+        print('Raw values:', raw_tag_values)
         sender = getaddresses([pmsg.get('from') or ''])
         subject = pmsg.get('subject') or None
         # AWS tags cannot contain brackets (among other values);
         msg_id = remove_brackets_pattern.sub('', ses_msg.rfc822_message_id)
+        tags = dict(
+            Sender=(sender and sender[0][1][:255]) or None,
+            Subject=subject and subject[:255],
+            RFC822MessageID=msg_id if len(msg_id) <= 255 else None,
+        )
+        print('Real values:', tags)
         try:
-            ses_msg.set_tags(
-                dict(
-                    Sender=(sender and sender[0][1][:255]) or None,
-                    Subject=subject and subject[:255],
-                    RFC822MessageID=msg_id if len(msg_id) <= 255 else None,
-                ),
-            )
+            ses_msg.set_tags(tags)
         except ClientError as err:
             if err.response.get('Error', {}).get('Code') != 'InvalidTag':
                 raise
@@ -719,7 +726,7 @@ def forward_email(
     # Note that this may occur multiple times, and the consumer is responsible for deduplicating
     # events.
     if not mark_as_spam and disposition == ForwardingDisposition.PROCEED and EVENTS_TOPIC_ARN:
-        # publish to sns
+        print(f'Publishing receive event to {EVENTS_TOPIC_ARN}')
         sns_client.publish(
             TopicArn=EVENTS_TOPIC_ARN,
             Message=json.dumps(dict(type="receive", bucket=ses_msg.bucket, key=ses_msg.key)),
