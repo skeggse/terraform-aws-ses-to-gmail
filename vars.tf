@@ -16,6 +16,11 @@ variable "s3_bucket_prefix" {
   default = null
 }
 
+variable "events_sns_topic_arn" {
+  type    = string
+  default = null
+}
+
 variable "ses_rule_set_name" {
   type    = string
   default = "default-rule-set"

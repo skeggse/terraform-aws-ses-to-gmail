@@ -43,6 +43,20 @@ data "aws_iam_policy_document" "function-policy" {
       "arn:aws:ssm:${local.local_arn_infix}:parameter/${trimprefix(param, "/")}"
     ]
   }
+
+  dynamic "statement" {
+    for_each = range(var.events_sns_topic_arn == null ? 0 : 1)
+
+    content {
+      effect = "Allow"
+      actions = [
+        "sns:Publish",
+      ]
+      resources = [
+        var.events_sns_topic_arn,
+      ]
+    }
+  }
 }
 
 module "function_role" {

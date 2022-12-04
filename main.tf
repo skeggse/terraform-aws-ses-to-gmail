@@ -131,6 +131,8 @@ module "function" {
 
     EXTRA_GMAIL_LABEL_IDS = join(":", var.extra_gmail_label_ids)
 
+    EVENTS_TOPIC_ARN = var.events_sns_topic_arn
+
     PYTHONPATH = "site-packages"
   }
 }

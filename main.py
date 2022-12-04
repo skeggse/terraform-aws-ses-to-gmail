@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import Message
 from email.generator import BytesGenerator
 from email.parser import BytesParser
-from email.utils import format_datetime, parsedate_to_datetime
+from email.utils import format_datetime, parsedate_to_datetime, getaddresses
 from enum import Enum
 from functools import cache, partial, wraps
 from inspect import getfullargspec, ismethod
@@ -38,6 +38,7 @@ GMAIL_DELIVERY_TIMEOUT = timedelta(minutes=2)
 ACCEPTABLE_DELIVERY_DELAY = 15 * 60
 
 s3_client = boto3.client('s3', region_name=region)
+sns_client = boto3.client('sns', region_name=region)
 ssm_client = boto3.client('ssm', region_name=region)
 
 client_id = environ['GOOGLE_CLIENT_ID']
@@ -52,6 +53,8 @@ label_ids = list(set(base_label_ids) | extra_gmail_label_ids)
 
 s3_bucket = environ['S3_BUCKET']
 s3_prefix = environ.get('S3_PREFIX', '')
+
+EVENTS_TOPIC_ARN = environ.get('EVENTS_TOPIC_ARN')
 
 account_id = environ['AWS_ACCOUNT_ID']
 
@@ -217,10 +220,9 @@ def google_session() -> requests.Session:
             client_id=client_id,
             client_secret=client_secret,
         ),
-        # New tokens that get auto-refreshed should not interrupt the request,
-        # as we do not store the new access tokens. This may result in other
-        # access tokens expiring randomly, so this only works for low-
-        # concurrency applications.
+        # New tokens that get auto-refreshed should not interrupt the request, as we do not store
+        # the new access tokens. This may result in other access tokens expiring randomly, so this
+        # only works for low- concurrency applications.
         token_updater=lambda token: None,
         token_fetcher=lambda: get_parameter(token_parameter)['refresh_token'],
         token=dict(
@@ -548,12 +550,16 @@ class SESMessage:
         '''Check whether the message has already been marked as forwarded. Cached.'''
         return self.get_tags().get('Forwarded') == 'true'
 
-    def set_tags(self, tags: dict[str, str]) -> None:
+    def set_tags(self, tags: dict[str, Optional[str]]) -> None:
         '''Mark the message's S3 object with particular tags.'''
         s3_client.put_object_tagging(
             Bucket=self.bucket,
             Key=self.key,
-            Tagging=dict(TagSet=[dict(Key=key, Value=value) for key, value in tags.items()]),
+            Tagging=dict(
+                TagSet=[
+                    dict(Key=key, Value=value) for key, value in tags.items() if value is not None
+                ]
+            ),
         )
 
     @property
@@ -685,9 +691,31 @@ def forward_email(
             pmsg, linesep=infer_linesep(bytes(ses_msg))
         )
 
+    if disposition == ForwardingDisposition.PROCEED:
+        # Not important if this happens multiple times, because it'll be consistent. These tags are
+        # useful for processing by other systems, especially when coupled with EVENTS_TOPIC_ARN.
+        sender = getaddresses([pmsg.get('from') or ''])
+        ses_msg.set_tags(
+            dict(
+                Sender=(sender and sender[0][1]) or None,
+                Subject=pmsg.get('subject'),
+                RFC822MessageID=ses_msg.rfc822_message_id,
+            ),
+        )
+
+    # Note that this may occur multiple times, and the consumer is responsible for deduplicating
+    # events.
+    if not mark_as_spam and disposition == ForwardingDisposition.PROCEED and EVENTS_TOPIC_ARN:
+        # publish to sns
+        sns_client.publish(
+            TopicArn=EVENTS_TOPIC_ARN,
+            Message=json.dumps(dict(type="receive", bucket=ses_msg.bucket, key=ses_msg.key)),
+        )
+
     _gmail_message = insert_message(ses_msg=ses_msg, metadata=message_metadata)
 
     matched_copies = deduplicate_email(ses_msg.rfc822_message_id)
+
     if not matched_copies:
         print(f'No messages found for rfc822 message id `{ses_msg.rfc822_message_id}`')
     elif matched_copies > 3:
