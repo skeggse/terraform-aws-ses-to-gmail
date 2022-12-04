@@ -710,6 +710,7 @@ def forward_email(
         sns_client.publish(
             TopicArn=EVENTS_TOPIC_ARN,
             Message=json.dumps(dict(type="receive", bucket=ses_msg.bucket, key=ses_msg.key)),
+            MessageDeduplicationId=ses_msg.key,
         )
 
     _gmail_message = insert_message(ses_msg=ses_msg, metadata=message_metadata)
