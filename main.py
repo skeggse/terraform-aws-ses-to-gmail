@@ -734,6 +734,10 @@ def forward_email(
             'subject': pmsg.get('subject') or '',
             'message-id': ses_msg.rfc822_message_id,
         }
+        if raw_tag_values['subject']:
+            # Support decoding headers like 'The Perfect Gift For Olive Oil Lovers =?UTF-8?B?8J+rkg==?='
+            # into 'The Perfect Gift For Olive Oil Lovers 🫒'
+            raw_tag_values['subject'] = str(make_header(decode_header(raw_tag_values['subject'])))
         print('Setting tags')
         print('Raw values:', raw_tag_values)
         sender = getaddresses([raw_tag_values['from']])
