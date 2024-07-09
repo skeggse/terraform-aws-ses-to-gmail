@@ -833,14 +833,26 @@ def lambda_handler(event: dict[str, Any], context: Any) -> None:  # pylint: disa
     '''
 
     dispositions = set()
+    exceptions = []
     for ses_msg in get_event_messages(event):
         disposition = get_forwarding_disposition(event, ses_msg)
         dispositions.add(disposition)
         if disposition in (ForwardingDisposition.PROCEED, ForwardingDisposition.RECOVER):
             # TODO: don't re-forward deleted emails. This will only happen if we are
             # unsuccessful in recording the result from Gmail's API as a Forwarded=true.
-            forward_email(ses_msg, disposition)
+            try:
+                forward_email(ses_msg, disposition)
+            except Exception as err:
+                forward_fail = Exception("failed to forward s3://{ses_msg.bucket}/{ses_msg.key}")
+                forward_fail.__cause__ = err
+                exceptions.append(forward_fail)
 
     # TODO: improve retry strategy
     if 'Records' in event and ForwardingDisposition.WAIT in dispositions:
-        raise Exception('retrying SES request due to WAIT disposition')
+        exceptions.append(Exception('retrying SES request due to WAIT disposition'))
+
+    if len(exceptions) == 1:
+        raise exceptions[0]
+
+    if exceptions:
+        raise ExceptionGroup("multiple problems", exceptions)

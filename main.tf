@@ -2,7 +2,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 4"
+      version = ">= 4"
     }
   }
 }
@@ -113,7 +113,7 @@ module "function" {
   deploy_bucket = var.deploy_bucket
   # TODO: source these from the deploy object.
   handler = "main.lambda_handler"
-  runtime = "python3.9"
+  runtime = "python3.11"
 
   timeout                = 60
   memory_size            = 256
