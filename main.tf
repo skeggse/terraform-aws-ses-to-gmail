@@ -115,8 +115,8 @@ module "function" {
   handler = "main.lambda_handler"
   runtime = "python3.11"
 
-  timeout                = 60
-  memory_size            = 256
+  timeout                = 180
+  memory_size            = 512
   logs_retention_in_days = 90
 
   env_vars = {
